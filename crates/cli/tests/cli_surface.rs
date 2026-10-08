@@ -158,6 +158,7 @@ fn help_shows_only_current_commands() {
     assert!(stdout.contains("doctor"));
     assert!(stdout.contains("priority"));
     assert!(stdout.contains("reserve"));
+    assert!(stdout.contains("weekly-reset"));
 
     for removed in [
         "  add ",
@@ -436,7 +437,7 @@ emailAddress = "active@example.com"
 
 /// Provider 同步元数据时按默认值重建账号；用户设的优先级不能被下一次默认入口冲掉。
 #[test]
-fn priority_and_reserve_survive_default_entry_metadata_sync() {
+fn account_preferences_survive_default_entry_metadata_sync() {
     let tmp = tempfile::tempdir().unwrap();
     setup_test_keychain(&tmp);
     write_fast_quota_timeout(&tmp);
@@ -491,14 +492,48 @@ emailAddress = "active@example.com"
         .output()
         .unwrap();
     assert!(!too_high.status.success());
+    let weekly = assert_success(
+        isolated_subswap(&tmp)
+            .args([
+                "weekly-reset",
+                "active@example.com",
+                "sunday",
+                "04:00",
+                "--json",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert!(
+        weekly.contains("weekly reset claude/active@example.com → Sun 04:00 UTC"),
+        "{weekly}"
+    );
+    let bad_day = isolated_subswap(&tmp)
+        .args(["weekly-reset", "active@example.com", "funday", "--json"])
+        .output()
+        .unwrap();
+    assert!(!bad_day.status.success());
 
     isolated_subswap(&tmp).arg("--json").output().unwrap();
 
     let listing = assert_success(isolated_subswap(&tmp).arg("priority").output().unwrap());
     assert!(
-        listing.contains("claude/active@example.com         7      15%"),
-        "priority or reserve lost after sync:\n{listing}"
+        listing.contains("claude/active@example.com         7      15%  Sun 04:00"),
+        "priority, reserve or weekly reset lost after sync:\n{listing}"
     );
+    assert_success(
+        isolated_subswap(&tmp)
+            .args(["weekly-reset", "active@example.com", "none", "--json"])
+            .output()
+            .unwrap(),
+    );
+    let cleared = assert_success(
+        isolated_subswap(&tmp)
+            .args(["weekly-reset", "active@example.com"])
+            .output()
+            .unwrap(),
+    );
+    assert!(cleared.contains("weekly reset not set"), "{cleared}");
     let saved = fs::read_to_string(&registry).unwrap();
     assert!(
         saved.contains("displayName = \"Renamed\""),
@@ -597,10 +632,17 @@ fn stop_failure_hook_records_rejection_for_live_account() {
 
     let saved: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(rejections_file(&tmp)).unwrap()).unwrap();
-    let entry = &saved["claude/work@example.com"];
+    let entry = &saved["rejections"]["claude/work@example.com"];
     assert_eq!(entry["kind"], "seven_day", "{saved}");
     assert_eq!(entry["reset_at"], "2100-01-01T00:00:00Z", "{saved}");
-    assert!(saved.get("claude/personal@example.com").is_none());
+    assert!(saved["rejections"]
+        .get("claude/personal@example.com")
+        .is_none());
+    // 带恢复时间的周限额拒绝顺带学到该账号的周重置时刻。
+    assert_eq!(
+        saved["weekly_anchors"]["claude/work@example.com"], "2100-01-01T00:00:00Z",
+        "{saved}"
+    );
     let audit = fs::read_to_string(app_data_dir(&tmp).join("audit.log")).unwrap();
     assert!(audit.contains("client_rejected"), "{audit}");
 
@@ -620,8 +662,15 @@ fn stop_failure_hook_records_rejection_for_live_account() {
             .output()
             .unwrap(),
     );
-    let saved = fs::read_to_string(rejections_file(&tmp)).unwrap();
-    assert!(!saved.contains("work@example.com"), "{saved}");
+    let saved: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(rejections_file(&tmp)).unwrap()).unwrap();
+    assert!(
+        saved["rejections"].get("claude/work@example.com").is_none(),
+        "{saved}"
+    );
+    assert!(saved["weekly_anchors"]
+        .get("claude/work@example.com")
+        .is_some());
 
     teardown_test_keychain(&tmp);
 }

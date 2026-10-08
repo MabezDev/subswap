@@ -185,6 +185,7 @@ mod tests {
             last_used_at: None,
             priority: 100,
             reserve_pct: 0,
+            weekly_reset: None,
             extra: serde_json::Map::new(),
         }
     }

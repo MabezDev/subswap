@@ -94,7 +94,15 @@ Attribution, which is also the race guard against the daemon: the account is the
 
 Effect: the daemon and default entry apply `RejectionStore::apply` before `decide` (the quota cache stays raw), adding a `Rejected` window that is always `Exhausted`. So the account swaps away, is never a candidate or return target, and joins the all-exhausted fallback with its unblock time as recovery. A rejected active account also bypasses manual hold and the active-quota uncertainty gate, because the rejection itself is the confirmation.
 
-Re-entry: blocked until `resetsAt` when the rejection carries it (session and weekly rejections do); otherwise for `auto_swap.rejection_block_ms` (default 7 days, after which any weekly limit has reset). A manual `swap` to the account clears the block, because an explicit choice means "try it"; if it is still limited the next rejection blocks it again. Expired entries are pruned on write and ignored on read.
+Re-entry (`rejections::unblock_at`), strongest evidence first:
+
+1. `resetsAt` carried by the rejection (session and weekly rejections do);
+2. the account's manual `weekly_reset` (`subswap weekly-reset <id|N> <day> [HH:MM]`, UTC), because an explicit setting beats inference;
+3. the earliest future reset of a weekly window the usage endpoint reports for that account (`7d` or a per-model `7d`; on the Team seat the Fable cap);
+4. a weekly anchor learned from an earlier `seven_day` rejection with `resetsAt` on that account, projected forward in 7-day steps;
+5. `auto_swap.rejection_block_ms` (default 7 days, after which any weekly limit has reset).
+
+Steps 2-4 take the next reset after the rejection. Guessing too early costs one failed request, after which the next rejection blocks again. The reset is not tied to signup: the personal plan started on a Sunday evening but resets on Saturday at 04:00 UTC, so no weekday is assumed. A manual `swap` to the account clears the block (the learned anchor stays), because an explicit choice means "try it". Expired entries are pruned on write, using the 7-day upper bound of steps 2-5, and ignored on read.
 
 The table shows the block as `hit 7d` / `hit 5h` / `hit [  0% left reset in …]`, also on rows whose usage query failed.
 

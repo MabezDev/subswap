@@ -253,6 +253,9 @@ fn prefs_tag(account: &subswap_core::Account) -> String {
     if account.reserve_pct > 0 {
         parts.push(format!("res {}%", account.reserve_pct));
     }
+    if let Some(w) = account.weekly_reset {
+        parts.push(format!("wk {w}"));
+    }
     parts.join(" ")
 }
 
@@ -262,8 +265,7 @@ fn policy_view(
     rejections: &RejectionStore,
     now: DateTime<Utc>,
 ) -> Vec<Quota> {
-    let quotas =
-        rejections.with_rejection(&awq.account.provider, &awq.account.id, &awq.quotas, now);
+    let quotas = rejections.with_rejection(&awq.account, &awq.quotas, now);
     reserve_adjusted_quotas(&awq.account, &quotas)
 }
 
@@ -756,6 +758,7 @@ mod tests {
                 last_used_at: None,
                 priority: 100,
                 reserve_pct: 0,
+                weekly_reset: None,
                 extra: serde_json::Map::new(),
             },
             quotas: Vec::new(),

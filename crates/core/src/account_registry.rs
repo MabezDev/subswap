@@ -154,6 +154,7 @@ impl AccountRegistry {
         {
             account.priority = existing.priority;
             account.reserve_pct = existing.reserve_pct;
+            account.weekly_reset = existing.weekly_reset;
             *existing = account;
         } else {
             all.push(account);
@@ -169,6 +170,16 @@ impl AccountRegistry {
     /// 设置账号保留余量百分比（0 表示不保留）。
     pub fn set_reserve_pct(&self, provider: &str, id: &AccountId, reserve_pct: u8) -> Result<()> {
         self.update(provider, id, |account| account.reserve_pct = reserve_pct)
+    }
+
+    /// 设置账号周额度重置时刻（`None` 清除）。
+    pub fn set_weekly_reset(
+        &self,
+        provider: &str,
+        id: &AccountId,
+        weekly_reset: Option<crate::model::WeeklyReset>,
+    ) -> Result<()> {
+        self.update(provider, id, |account| account.weekly_reset = weekly_reset)
     }
 
     fn update(&self, provider: &str, id: &AccountId, f: impl FnOnce(&mut Account)) -> Result<()> {
@@ -273,6 +284,7 @@ mod tests {
             last_used_at: None,
             priority: 100,
             reserve_pct: 0,
+            weekly_reset: None,
             extra: serde_json::Map::new(),
         }
     }
@@ -307,6 +319,12 @@ mod tests {
             .unwrap();
         reg.set_reserve_pct("claude", &AccountId("a".into()), 15)
             .unwrap();
+        reg.set_weekly_reset(
+            "claude",
+            &AccountId("a".into()),
+            Some("sun 04:00".parse().unwrap()),
+        )
+        .unwrap();
 
         let mut resynced = make_account("claude", "a");
         resynced.label = "renamed".into();
@@ -315,6 +333,7 @@ mod tests {
         let a = reg.find("claude", &AccountId("a".into())).unwrap().unwrap();
         assert_eq!(a.priority, 10);
         assert_eq!(a.reserve_pct, 15);
+        assert_eq!(a.weekly_reset.unwrap().to_string(), "Sun 04:00");
         assert_eq!(a.label, "renamed");
     }
 

@@ -2,13 +2,14 @@
 //!
 //! - priority：数字越小越优先，默认 100。
 //! - reserve：每个窗口留给 subswap 之外的余量百分比，默认 0。
+//! - weekly-reset：周额度重置时刻（UTC），客户端被拒且上游没给恢复时间时用来推算解封。
 //!
 //! 只写 registry，不查 quota、不切换；效果交给默认入口 / daemon 的自动切换。
 
 use std::io::{self, IsTerminal};
 
 use anyhow::Result;
-use subswap_core::{Account, AuditEvent};
+use subswap_core::{Account, AuditEvent, WeeklyReset};
 
 use crate::app::AppContext;
 use crate::cmd::resolve_account;
@@ -57,6 +58,42 @@ pub fn reserve(ctx: &AppContext, target: Option<&str>, pct: Option<u8>) -> Resul
     Ok(true)
 }
 
+/// 返回 `true` 表示改了重置时刻，调用方应再打印余量表。`when` 为 `none` 时清除。
+pub fn weekly_reset(ctx: &AppContext, target: Option<&str>, when: &[String]) -> Result<bool> {
+    let Some(acc) = target.map(|t| resolve_account(ctx, t)).transpose()? else {
+        print_listing(
+            ctx,
+            "weekly-reset <N | id | provider/id> <day> [HH:MM]   (UTC; `none` to clear)",
+        )?;
+        return Ok(false);
+    };
+    if when.is_empty() {
+        let shown = acc
+            .weekly_reset
+            .map_or_else(|| "not set".to_string(), |w| format!("{w} UTC"));
+        println!("{}/{}  weekly reset {shown}", acc.provider, acc.id);
+        return Ok(false);
+    }
+    let joined = when.join(" ");
+    let value = if joined.eq_ignore_ascii_case("none") {
+        None
+    } else {
+        Some(
+            joined
+                .parse::<WeeklyReset>()
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
+        )
+    };
+    ctx.registry
+        .set_weekly_reset(&acc.provider, &acc.id, value)?;
+    record(ctx, "set_weekly_reset", &acc);
+    match value {
+        Some(w) => println!("weekly reset {}/{} → {w} UTC", acc.provider, acc.id),
+        None => println!("weekly reset {}/{} cleared", acc.provider, acc.id),
+    }
+    Ok(true)
+}
+
 fn record(ctx: &AppContext, action: &str, acc: &Account) {
     ctx.audit.append(AuditEvent::ok(
         action,
@@ -81,12 +118,18 @@ fn print_listing(ctx: &AppContext, usage: &str) -> Result<()> {
         .map(|a| a.provider.len() + 1 + a.id.0.len())
         .max()
         .unwrap_or(0);
-    println!("       {:<width$}  priority  reserve", "");
+    println!(
+        "       {:<width$}  priority  reserve  weekly reset (UTC)",
+        ""
+    );
     for (idx, acc) in ordered.iter().enumerate() {
         let star = if acc.active { "*" } else { " " };
         let qualified = format!("{}/{}", acc.provider, acc.id);
+        let weekly = acc
+            .weekly_reset
+            .map_or_else(|| "-".to_string(), |w| w.to_string());
         let line = format!(
-            "  {star} {:>2} {qualified:<width$}  {:>8}  {:>6}%",
+            "  {star} {:>2} {qualified:<width$}  {:>8}  {:>6}%  {weekly}",
             idx + 1,
             acc.priority,
             acc.reserve_pct

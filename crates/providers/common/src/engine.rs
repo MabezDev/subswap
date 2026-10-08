@@ -245,6 +245,7 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
             last_used_at: existing.and_then(|a| a.last_used_at),
             priority: 100,
             reserve_pct: 0,
+            weekly_reset: None,
             extra,
         };
         self.registry.upsert(account.clone())?;
@@ -881,6 +882,7 @@ mod tests {
             last_used_at: None,
             priority: 100,
             reserve_pct: 0,
+            weekly_reset: None,
             extra: serde_json::Map::new(),
         }
     }

@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use subswap_core::paths::AppPaths;
-use subswap_core::rejections::{record_rejection, Rejection};
+use subswap_core::rejections::{record_rejection, record_weekly_anchor, Rejection};
 use subswap_core::{Account, AccountId, AccountRegistry, AuditEvent, AuditLog};
 use subswap_provider_claude::stop_failure::{self, HookInput};
 
@@ -60,13 +60,18 @@ pub fn run_claude_stop_failure() -> Result<()> {
         return Ok(());
     }
 
+    let reset_at = scanned.as_ref().and_then(|r| r.reset_at);
+    let kind = scanned.and_then(|r| r.kind);
+    if let (Some(reset), Some("seven_day")) = (reset_at, kind.as_deref()) {
+        record_weekly_anchor(PROVIDER, &account.id, reset)?;
+    }
     record_rejection(
         PROVIDER,
         &account.id,
         Rejection {
             rejected_at,
-            reset_at: scanned.as_ref().and_then(|r| r.reset_at),
-            kind: scanned.and_then(|r| r.kind),
+            reset_at,
+            kind,
         },
     )?;
     audit.append(AuditEvent::ok(
@@ -159,6 +164,7 @@ mod tests {
             last_used_at,
             priority: 100,
             reserve_pct: 0,
+            weekly_reset: None,
             extra: serde_json::Map::new(),
         }
     }

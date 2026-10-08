@@ -594,6 +594,7 @@ mod tests {
             last_used_at: None,
             priority: 100,
             reserve_pct: 0,
+            weekly_reset: None,
             extra: Default::default(),
         };
         if manual_only {

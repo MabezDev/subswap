@@ -40,7 +40,7 @@ Windows: %APPDATA%\subswap\subswap\config\config.toml
 | `auto_swap.cooldown_ms` | `300000` | 毫秒 | 切换后该账号冷却期，daemon 内不再选回 |
 | `auto_swap.settle_grace_ms` | `60000` | ms | Legacy compatibility setting; since v1.11.1 uncertain quotas always preserve the active account, regardless of this duration |
 | `auto_swap.return_threshold` | `defaults::AUTO_SWAP_RETURN_THRESHOLD` | 0.0~1.0 | 当前账号健康时，`priority` 更优的账号 5h 窗口 `used/limit` 低于此值（设了 reserve 时按同等间隔下移）才切回它，长窗口未阻断即可；须明显低于 `threshold`（两者间隔是防振荡滞回带）。所有账号同优先级时无效果 |
-| `auto_swap.rejection_block_ms` | `defaults::AUTO_SWAP_REJECTION_BLOCK_MS`（7 天） | 毫秒 | 客户端上报的被拒（Claude Code `StopFailure` hook）没有上游恢复时间时的封锁时长；有 `resetsAt` 时按它解封。到期后账号重新参与自动切换，仍受限会被下一次拒绝重新封锁 |
+| `auto_swap.rejection_block_ms` | `defaults::AUTO_SWAP_REJECTION_BLOCK_MS`（7 天） | 毫秒 | 客户端上报的被拒（Claude Code `StopFailure` hook）的最后兜底封锁时长：只有在没有上游 `resetsAt`、没有手动 `weekly-reset`、usage 端点也没报出周窗口、也没学到周重置时才用。到期后账号重新参与自动切换，仍受限会被下一次拒绝重新封锁 |
 | `auto_swap.manual_hold_ms` | `600000` | 毫秒 | 手动 `swap` / `login` 后该 provider 暂停一切自动切换（含确定性额度切换），避免把显式选择掰回去；`0` 关闭 |
 | `quota.warn_pct` | `90.0` | 0~100 | CLI 显示 `warn` 的阈值；不参与切换决策 |
 | `quota.exhausted_pct` | `100.0` | 0~100 | CLI 显示 `full` 的阈值；不参与切换决策 |

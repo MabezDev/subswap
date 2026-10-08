@@ -467,6 +467,7 @@ impl CursorProvider {
             last_used_at: existing.and_then(|account| account.last_used_at),
             priority: 100,
             reserve_pct: 0,
+            weekly_reset: None,
             extra,
         };
         self.registry.upsert(account.clone())?;

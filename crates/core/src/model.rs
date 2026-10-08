@@ -45,6 +45,10 @@ pub struct Account {
     /// 只由 `subswap reserve` 修改，[`crate::AccountRegistry::upsert`] 会保留已有值。
     #[serde(default, skip_serializing_if = "is_zero")]
     pub reserve_pct: u8,
+    /// 用户指定的周额度重置时刻（UTC）。客户端被拒且上游没给恢复时间时，按它推算解封时间；
+    /// 只由 `subswap weekly-reset` 修改，[`crate::AccountRegistry::upsert`] 会保留已有值。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weekly_reset: Option<WeeklyReset>,
     /// 任意 Provider 私有 KV，用于扩展（不入 keyring）。
     #[serde(default)]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -90,6 +94,92 @@ fn default_priority() -> i32 {
 
 fn is_zero(v: &u8) -> bool {
     *v == 0
+}
+
+/// 每周固定的重置时刻（UTC），如 `Sun 00:00`。序列化为该字符串。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct WeeklyReset {
+    pub weekday: chrono::Weekday,
+    pub hour: u32,
+    pub minute: u32,
+}
+
+impl WeeklyReset {
+    /// 严格晚于 `after` 的下一次重置时刻。
+    pub fn next_after(&self, after: DateTime<Utc>) -> DateTime<Utc> {
+        use chrono::{Datelike, Duration, TimeZone};
+        let days_ahead = (i64::from(self.weekday.num_days_from_monday())
+            - i64::from(after.weekday().num_days_from_monday()))
+        .rem_euclid(7);
+        let date = after.date_naive() + Duration::days(days_ahead);
+        let candidate = Utc.from_utc_datetime(
+            &date
+                .and_hms_opt(self.hour, self.minute, 0)
+                .expect("hour and minute validated on construction"),
+        );
+        if candidate > after {
+            candidate
+        } else {
+            candidate + Duration::days(7)
+        }
+    }
+}
+
+impl fmt::Display for WeeklyReset {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} {:02}:{:02}", self.weekday, self.hour, self.minute)
+    }
+}
+
+impl std::str::FromStr for WeeklyReset {
+    type Err = String;
+
+    /// 接受 `sun`、`Sunday 05:30` 等：星期必填，时刻可省（默认 00:00）。
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        let mut parts = s.split_whitespace();
+        let weekday: chrono::Weekday = parts
+            .next()
+            .ok_or("expected a weekday, e.g. `sun` or `sun 04:00`")?
+            .parse()
+            .map_err(|_| format!("unknown weekday in {s:?}"))?;
+        let (hour, minute) = match parts.next() {
+            None => (0, 0),
+            Some(t) => {
+                let (h, m) = t
+                    .split_once(':')
+                    .ok_or_else(|| format!("expected HH:MM, got {t:?}"))?;
+                let hour: u32 = h.parse().map_err(|_| format!("bad hour in {t:?}"))?;
+                let minute: u32 = m.parse().map_err(|_| format!("bad minute in {t:?}"))?;
+                if hour > 23 || minute > 59 {
+                    return Err(format!("time out of range: {t:?}"));
+                }
+                (hour, minute)
+            }
+        };
+        if parts.next().is_some() {
+            return Err(format!("unexpected trailing text in {s:?}"));
+        }
+        Ok(Self {
+            weekday,
+            hour,
+            minute,
+        })
+    }
+}
+
+impl TryFrom<String> for WeeklyReset {
+    type Error = String;
+
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl From<WeeklyReset> for String {
+    fn from(value: WeeklyReset) -> Self {
+        value.to_string()
+    }
 }
 
 /// 账号的计费方式：决定它在自动切换中的优先级与对外的"是否真花钱"语义。
@@ -259,4 +349,49 @@ pub struct ClientTarget {
     pub display_name: String,
     /// 该客户端的根目录或主配置文件，doctor 用来探测是否存在。
     pub probe_path: std::path::PathBuf,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(s: &str) -> DateTime<Utc> {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn weekly_reset_parses_and_round_trips() {
+        let r: WeeklyReset = "sunday 04:30".parse().unwrap();
+        assert_eq!(r.to_string(), "Sun 04:30");
+        assert_eq!(
+            "sun".parse::<WeeklyReset>().unwrap().to_string(),
+            "Sun 00:00"
+        );
+        for bad in ["", "funday", "sun 24:00", "sun 4", "sun 04:00 extra"] {
+            assert!(bad.parse::<WeeklyReset>().is_err(), "{bad:?}");
+        }
+        let json = serde_json::to_string(&r).unwrap();
+        assert_eq!(json, "\"Sun 04:30\"");
+        assert_eq!(serde_json::from_str::<WeeklyReset>(&json).unwrap(), r);
+    }
+
+    #[test]
+    fn weekly_reset_next_after_is_strictly_later_and_within_a_week() {
+        let sun_midnight: WeeklyReset = "sun 00:00".parse().unwrap();
+        // 2026-10-08 是周四。
+        assert_eq!(
+            sun_midnight.next_after(at("2026-10-08T14:00:00Z")),
+            at("2026-10-11T00:00:00Z")
+        );
+        // 恰好在重置时刻：取下一周。
+        assert_eq!(
+            sun_midnight.next_after(at("2026-10-11T00:00:00Z")),
+            at("2026-10-18T00:00:00Z")
+        );
+        let thu_late: WeeklyReset = "thu 20:00".parse().unwrap();
+        assert_eq!(
+            thu_late.next_after(at("2026-10-08T14:00:00Z")),
+            at("2026-10-08T20:00:00Z")
+        );
+    }
 }

@@ -12,6 +12,7 @@
 //!   the quota table.
 //! - `subswap priority [<id|N> [<value>]]` — show or set account priority (lower is preferred).
 //! - `subswap reserve [<id|N> [<percent>]]` — show or set the quota percent autoswap leaves unused.
+//! - `subswap weekly-reset [<id|N> [<day> [HH:MM]|none]]` — set the weekly reset used for rejections.
 //! - `subswap hooks [install|uninstall]` — manage the Claude Code hook that reports rejections.
 //! - `subswap doctor`        — environment self-check.
 //!
@@ -194,6 +195,16 @@ enum Cmd {
         percent: Option<u8>,
     },
 
+    /// Show or set an account's weekly limit reset time (UTC). Used to estimate when a
+    /// rejected account becomes usable again when the client gave no reset time.
+    WeeklyReset {
+        /// Account index (e.g. `3`), id, label, or `<provider>/<id>`. Omit to list all.
+        id: Option<String>,
+
+        /// Weekday and optional time, e.g. `sun` or `sun 04:00`; `none` clears it.
+        when: Vec<String>,
+    },
+
     /// Show, install or remove the Claude Code hook that reports usage-limit rejections,
     /// so autoswap reacts to limits the usage endpoint does not show.
     Hooks {
@@ -312,6 +323,12 @@ async fn main() -> Result<()> {
         }
         Some(Cmd::Reserve { id, percent }) => {
             if cmd::prefs::reserve(&ctx, id.as_deref(), percent)? && !cli.json {
+                cmd::default::print_status_overview(&ctx).await?;
+            }
+            Ok(())
+        }
+        Some(Cmd::WeeklyReset { id, when }) => {
+            if cmd::prefs::weekly_reset(&ctx, id.as_deref(), &when)? && !cli.json {
                 cmd::default::print_status_overview(&ctx).await?;
             }
             Ok(())
