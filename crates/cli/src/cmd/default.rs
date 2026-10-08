@@ -898,6 +898,7 @@ mod tests {
             allow_unknown: false,
             settle_grace_ms: 60_000,
             manual_hold_ms: 0,
+            return_threshold: 0.90,
         };
         let tmp = tempfile::tempdir().unwrap();
         let audit = AuditLog::new(tmp.path().join("audit.log"));
@@ -1046,6 +1047,7 @@ mod tests {
             allow_unknown: false,
             settle_grace_ms: 60_000,
             manual_hold_ms: 0,
+            return_threshold: 0.90,
         };
         let tmp = tempfile::tempdir().unwrap();
         let audit = AuditLog::new(tmp.path().join("audit.log"));
@@ -1134,6 +1136,7 @@ mod tests {
             allow_unknown: false,
             settle_grace_ms: 0,
             manual_hold_ms: 0,
+            return_threshold: 0.90,
         };
         let tmp = tempfile::tempdir().unwrap();
         let audit = AuditLog::new(tmp.path().join("audit.log"));

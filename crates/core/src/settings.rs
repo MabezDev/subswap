@@ -58,6 +58,9 @@ pub struct AutoSwap {
     /// 手动切换保持期（毫秒）：用户手动 `swap` / `login` 后，该 provider 在此窗口内
     /// 暂停一切自动切换（连确定性额度切换一起挡），避免把显式选择掰回去。
     pub manual_hold_ms: i64,
+    /// 回切偏好账号的余量门槛，0.0~1.0。偏好账号（`priority` 更小）所有判定窗口
+    /// used/limit 都低于此值时，才从健康的当前账号切回它。
+    pub return_threshold: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -115,6 +118,7 @@ impl Default for AutoSwap {
             cooldown_ms: defaults::AUTO_SWAP_COOLDOWN_MS,
             settle_grace_ms: defaults::AUTO_SWAP_SETTLE_GRACE_MS,
             manual_hold_ms: defaults::AUTO_SWAP_MANUAL_HOLD_MS,
+            return_threshold: defaults::AUTO_SWAP_RETURN_THRESHOLD,
         }
     }
 }
@@ -248,6 +252,10 @@ mod tests {
         assert_eq!(
             s.auto_swap.manual_hold_ms,
             defaults::AUTO_SWAP_MANUAL_HOLD_MS
+        );
+        assert_eq!(
+            s.auto_swap.return_threshold,
+            defaults::AUTO_SWAP_RETURN_THRESHOLD
         );
         assert_eq!(s.daemon.poll_interval_ms, defaults::DAEMON_POLL_INTERVAL_MS);
         assert_eq!(

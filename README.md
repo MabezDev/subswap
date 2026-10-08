@@ -96,6 +96,8 @@ subswap login codex
 subswap swap alice@example.com
 subswap swap claude/alice@example.com
 
+subswap priority 1 10   # prefer account 1: autoswap returns to it once it has headroom
+
 subswap run codex bob@example.com -- --version
 subswap shell claude/alice@example.com
 eval "$(subswap env codex/bob@example.com)"

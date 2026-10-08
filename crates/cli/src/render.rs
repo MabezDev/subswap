@@ -381,9 +381,14 @@ fn attempt_count(err: &str) -> Option<&str> {
 }
 
 pub fn format_quota_compact(q: &Quota, color: bool) -> String {
+    let model_week_label;
     let w_label = match q.window {
         QuotaWindow::FiveHour => "5h",
         QuotaWindow::SevenDay => "7d",
+        QuotaWindow::ModelWeek => {
+            model_week_label = format!("7d {}", q.note.as_deref().unwrap_or("model"));
+            model_week_label.as_str()
+        }
         QuotaWindow::Month => "mo",
         // Cursor 官方模型窗口；必须短标签，否则默认入口一行会被撑爆。
         QuotaWindow::FirstPartyModels => "1st",
@@ -464,13 +469,14 @@ fn window_display_order(window: QuotaWindow) -> u8 {
     match window {
         QuotaWindow::FiveHour => 0,
         QuotaWindow::SevenDay => 1,
-        QuotaWindow::Month => 2,
-        QuotaWindow::FirstPartyModels => 3,
-        QuotaWindow::Api => 4,
+        QuotaWindow::ModelWeek => 2,
+        QuotaWindow::Month => 3,
+        QuotaWindow::FirstPartyModels => 4,
+        QuotaWindow::Api => 5,
         // Credits 追加在 1st / API 之后；重置道具挂最后（Custom 之前）。
-        QuotaWindow::Credits => 5,
-        QuotaWindow::ResetCredits => 6,
-        QuotaWindow::Custom => 7,
+        QuotaWindow::Credits => 6,
+        QuotaWindow::ResetCredits => 7,
+        QuotaWindow::Custom => 8,
     }
 }
 
@@ -737,6 +743,30 @@ mod tests {
             text.contains("signed in as auth0|u1 but not tracked"),
             "notice line must print even with zero accounts: {text}"
         );
+    }
+
+    #[test]
+    fn model_week_label_names_the_model() {
+        let mut q = quota(QuotaWindow::ModelWeek, 26, 100, QuotaStatus::Ok);
+        q.note = Some("Fable".into());
+        let s = format_quota_compact(&q, false);
+        assert!(s.starts_with("7d Fable [ 74% left"), "{s}");
+    }
+
+    #[test]
+    fn model_week_renders_after_all_model_7d() {
+        let mut scoped = quota(QuotaWindow::ModelWeek, 26, 100, QuotaStatus::Ok);
+        scoped.note = Some("Fable".into());
+        let quotas = vec![
+            scoped,
+            quota(QuotaWindow::SevenDay, 25, 100, QuotaStatus::Ok),
+            quota(QuotaWindow::FiveHour, 23, 100, QuotaStatus::Ok),
+        ];
+        let rendered = render_quota_parts(&quotas, 0, false);
+        let five = rendered.find("5h [").unwrap();
+        let seven = rendered.find("7d [").unwrap();
+        let fable = rendered.find("7d Fable [").unwrap();
+        assert!(five < seven && seven < fable, "{rendered}");
     }
 
     #[test]

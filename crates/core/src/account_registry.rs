@@ -142,16 +142,34 @@ impl AccountRegistry {
     }
 
     /// 插入或更新一个账号（按 (provider, id) 主键去重）。
-    pub fn upsert(&self, account: Account) -> Result<()> {
+    ///
+    /// 更新时保留已有 `priority`：各 Provider 同步元数据时都按默认值重建 `Account`，
+    /// 不保留会把用户用 [`Self::set_priority`] 设的偏好在下一次同步时冲掉。
+    pub fn upsert(&self, mut account: Account) -> Result<()> {
         let mut all = self.load()?;
         if let Some(existing) = all
             .iter_mut()
             .find(|a| a.provider == account.provider && a.id == account.id)
         {
+            account.priority = existing.priority;
             *existing = account;
         } else {
             all.push(account);
         }
+        self.save(&all)
+    }
+
+    /// 设置账号优先级（数字越小越优先）。
+    pub fn set_priority(&self, provider: &str, id: &AccountId, priority: i32) -> Result<()> {
+        let mut all = self.load()?;
+        let account = all
+            .iter_mut()
+            .find(|a| a.provider == provider && a.id == *id)
+            .ok_or_else(|| Error::AccountNotFound {
+                provider: provider.into(),
+                id: id.to_string(),
+            })?;
+        account.priority = priority;
         self.save(&all)
     }
 
@@ -266,6 +284,32 @@ mod tests {
 
         let claudes = reg.list_by_provider("claude").unwrap();
         assert_eq!(claudes.len(), 2);
+    }
+
+    #[test]
+    fn upsert_keeps_user_priority() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = AccountRegistry::new(tmp.path().join("registry.toml"));
+        reg.upsert(make_account("claude", "a")).unwrap();
+        reg.set_priority("claude", &AccountId("a".into()), 10)
+            .unwrap();
+
+        let mut resynced = make_account("claude", "a");
+        resynced.label = "renamed".into();
+        reg.upsert(resynced).unwrap();
+
+        let a = reg.find("claude", &AccountId("a".into())).unwrap().unwrap();
+        assert_eq!(a.priority, 10);
+        assert_eq!(a.label, "renamed");
+    }
+
+    #[test]
+    fn set_priority_rejects_unknown_account() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = AccountRegistry::new(tmp.path().join("registry.toml"));
+        assert!(reg
+            .set_priority("claude", &AccountId("missing".into()), 1)
+            .is_err());
     }
 
     #[test]

@@ -64,6 +64,13 @@ Token 刷新体：`{"grant_type":"refresh_token","refresh_token":"...","client_i
 - `extra_usage.utilization` / `extra_usage.resets_at` / `extra_usage.monthly_limit` / `extra_usage.used_credits`
   （`extra_usage` 无 `utilization` 时不产生 `Month` 窗口，直接跳过，与 OpenCode 缺失窗口跳过一致；
   否则常驻的 `limit == 0 / Unknown` 月窗口会把全员耗尽回退池永久挡死）
+- `limits[]`（2026-10 实样）：`{kind, group, percent, severity, resets_at, scope, is_active}`。
+  只取 `group = "weekly"` 且带 `scope` 的项（如 `weekly_scoped` + `scope.model.display_name = "Fable"`）
+  → `QuotaWindow::ModelWeek`，`note` 存模型名，表格显示 `7d Fable`；与 `7d` 一样只在耗尽时阻断自动切换。
+  无 `scope` 的 `session` / `weekly_all` 与 `five_hour` / `seven_day` 重复，跳过。
+  `is_active` 标的是当前最紧的那条限额（个人号 7d 满时是 `weekly_all`，Team 席位平时是 `session`），
+  不是「该限额是否生效」，不参与判定。
+  Team 席位（`subscriptionType = team`）实测 `seven_day = null`，只有 5h + 按模型周额度。
 
 `utilization` 固定按 0~100 已用% 解析。**小于 1 仍表示不到 1% 已用，禁止当 0~1 比例放大**（否则 `0.97%`→`97%`）。
 

@@ -9,7 +9,7 @@
 
 Across every provider, the default entry and daemon must preserve the current account unless a completed quota query confirms its switching condition and another account is confirmed usable now. A faster candidate response, loading, empty/unknown quotas, quota-query errors (including quota endpoint 429), or stale cached exhaustion never establish that the current account must be replaced. Business-request rate limits are a separate signal; quota-query failures must not masquerade as that signal.
 
-When no confirmed usable target exists, preserve the current selection and degrade to manual action. Do not automatically move to a failed/unknown target or another depleted account merely because it resets sooner. Continue progressive quota collection so a confirmed depleted active account can switch as soon as a usable candidate becomes ready. Healthy accounts remain selected regardless of another account's larger balance or earlier reset. Preserve Cursor's parallel-pool semantics and all manual-only/manual-hold rules.
+When no confirmed usable target exists, preserve the current selection and degrade to manual action. Do not automatically move to a failed/unknown target or another depleted account merely because it resets sooner. Continue progressive quota collection so a confirmed depleted active account can switch as soon as a usable candidate becomes ready. Healthy accounts remain selected regardless of another account's larger balance or earlier reset; the only exception is an explicit user preference (`priority`), see §2.1. Preserve Cursor's parallel-pool semantics and all manual-only/manual-hold rules.
 
 ### All-exhausted fallback (2026-09-30, user decision)
 
@@ -21,7 +21,7 @@ The paragraph above is partially superseded: when **every** account is confirmed
 
 - 默认阈值：由 `crates/core/src/defaults.rs::AUTO_SWAP_THRESHOLD` 定义，运行时可由 `config.toml` 覆盖。
 - OpenCode 仅官方 Console 账号（`opencode`）参与自动换号；`opencode-api-key` 是独立的仅手动账号池，Key 不能成为自动候选，处于当前 Key 时也不会自动切走。
-- 适用窗口：只看小时级（当前可可靠识别 `FiveHour`）。Claude 7d、Codex 月度、OpenCode weekly/monthly 等长窗口即使接近阈值也不触发。OpenCode `rolling`（约 5 小时）映射为 `FiveHour`，走阈值触发。
+- 适用窗口：只看小时级（当前可可靠识别 `FiveHour`）。Claude 7d、Claude 按模型周额度（`ModelWeek`，如 Team 席位的 Fable 周上限）、Codex 月度、OpenCode weekly/monthly 等长窗口即使接近阈值也不触发，只在明确耗尽时阻断。OpenCode `rolling`（约 5 小时）映射为 `FiveHour`，走阈值触发。
 - 硬阻断：对 **Claude / Codex 等叠加上限**，任一参与自动切换的窗口 `Exhausted` 即触发/阻断。
   叠加窗口是嵌套包含关系（大窗口包含小窗口，如 `7d` 包含 `5h`、`mo` 包含 `7d`）：
   大窗口耗尽时小窗口余量不算数，账号整体不可用，直到所有阻塞窗口都恢复。
@@ -49,7 +49,7 @@ The paragraph above is partially superseded: when **every** account is confirmed
 
 ### 1.4 Progressive decisions
 
-The default entry queries accounts concurrently and re-evaluates the provider after every quota result (`fill_quotas_progressively` → `try_auto_swap_ready_provider`). While the active result is `Loading`, keep the current account. A `Failed` or `Stale` active result degrades without activation. After a `Ready` active result confirms a threshold breach or exhaustion, switch only when a usable target is also `Ready`; otherwise keep collecting results. A healthy active result always yields `NoOp`.
+The default entry queries accounts concurrently and re-evaluates the provider after every quota result (`fill_quotas_progressively` → `try_auto_swap_ready_provider`). While the active result is `Loading`, keep the current account. A `Failed` or `Stale` active result degrades without activation. After a `Ready` active result confirms a threshold breach or exhaustion, switch only when a usable target is also `Ready`; otherwise keep collecting results. A healthy active result yields `NoOp`, except for a return to a `Ready` preferred account (§2.1).
 
 `AutoSwapProgress.activated_targets` prevents duplicate activation and `abandoned` prevents switching back within one invocation. With confirmed usable targets, a completed switch naturally yields `NoOp`; there is no intermediate jump through an unknown or depleted account.
 
@@ -64,9 +64,25 @@ Apply these rules in order:
 3. Respect manual hold: a successful manual `swap` / `login` suspends all automatic switching for `auto_swap.manual_hold_ms` (default 10 minutes), including confirmed exhaustion. The persisted provider hold survives CLI exits and daemon restarts. A value of `0` disables it.
 4. Require a completed, non-stale query for the active account before evaluating its switching condition. Empty quotas, unknown status, and zero limits do not establish exhaustion. Cursor switches only when its parallel pools are all confirmed exhausted (or a separately reported hourly threshold is breached); a pool with unknown status is not confirmed exhausted.
 5. Require a `Ready` candidate with usable quota, no hourly threshold breach, and no blocking exhausted window. Cursor accepts any usable parallel pool. Failed, loading, and stale candidates are excluded, including authentication failures and quota endpoint 429. `PolicyConfig.allow_unknown` remains an explicit internal override for unknown windows in a completed response; the default entry and daemon set it to false. It never permits loading, failed, or stale responses.
-6. Among usable candidates, order by earliest gating `reset_at` (missing last; `ResetCredits` excluded), then usage ratio, account priority, and account ID. This ordering only selects a target after a valid trigger; it never replaces a healthy active account to gain more balance or an earlier reset.
+6. Among usable candidates, order by account priority (lower first, default 100), then earliest gating `reset_at` (missing last; `ResetCredits` excluded), usage ratio, and account ID. Priority comes first so a forced swap lands directly on the preferred account instead of a non-preferred one that §2.1 would immediately leave again. This ordering only selects a target after a valid trigger; it never replaces a healthy active account to gain more balance or an earlier reset (the §2.1 preference return is the only exception).
 7. If no usable candidate exists, try the all-exhausted fallback before degrading: it applies only when the active account is confirmed dead (at least one gating window `Exhausted` with limit > 0; a merely Warn/threshold-breached active account stays put) or when there is no active account. The pool admits only `Ready`, non-`manual_only`, non-active accounts whose gating windows are all confirmed (`limit > 0`, status known, account already unusable) with a known effective recovery time; failed, loading, stale, and unknown accounts never enter. Rank by effective recovery — stacked providers take the latest `reset_at` among blocking windows (`Exhausted` with limit > 0, plus `FiveHour` over threshold; any blocking window missing `reset_at` means unknown), Cursor parallel pools take the earliest known gating `reset_at` (first pool to recover) — tie: priority, then account ID, and swap only when the winner recovers strictly sooner than the active account (or the active recovery time is unknown / there is no active account); a non-empty pool whose winner is not sooner means stay (`NoOp`: current recovers soonest). If the pool is empty, return `Degraded` and re-evaluate after the next result or normal polling interval; do not add requests to force a decision.
 8. The daemon retains its five-minute account cooldown and checks the current active identity immediately before activation. Discard decisions if the active identity changed or became manual-only.
+
+### 2.1 Return to preferred account (2026-10-08, user decision)
+
+Use case: a personal plan with a weekly cap that is lost if unused, plus a Team seat with only a 5h window. The user wants to use the personal plan by default and use the work seat only as overflow, returning to the personal plan once it has recovered.
+
+Preference is `Account.priority` (lower is preferred, default 100), set with `subswap priority <id|N> <value>`. `AccountRegistry::upsert` keeps the stored value so provider metadata syncs never reset it. When every account keeps the default, nothing below applies and behavior is unchanged.
+
+When the active account is `Ready` and does not need to swap, `decide` returns `Swap` to another account only if all of the following hold:
+
+- its priority number is strictly lower than the active account's;
+- it passes the normal candidate rules (`Ready`, not `manual_only`, usable, no 5h threshold breach, no exhausted window; unknown is never enough);
+- every gating window is below `auto_swap.return_threshold` (default `defaults::AUTO_SWAP_RETURN_THRESHOLD`).
+
+Among several qualifying accounts, the most preferred wins (same ordering as rule 6). The gap between `return_threshold` and `threshold` is the hysteresis band: a preferred account is only re-entered when it is well clear of the swap-away line, so it cannot bounce back and forth on one window. Manual hold, manual-only active accounts, active-quota uncertainty, daemon cooldown and the flap/oscillation brake all apply unchanged, because the return goes through the same `decide` → `activate` path.
+
+Known costs: after a manual swap to a non-preferred account, the return happens once the manual hold expires; to stay put, give the accounts equal priority or turn autoswap off. On Codex a return swap rewrites live `auth.json`, so running sessions need a restart.
 
 `auto_swap.settle_grace_ms` and `PolicyConfig.settle_grace_ms` remain accepted for compatibility. Since v1.11.1, uncertain quotas always preserve the current account, regardless of account age or grace duration. The setting no longer changes the decision; confirmed exhaustion remains eligible for a meaningful switch. Manual hold continues to block even confirmed exhaustion.
 
@@ -159,6 +175,7 @@ enabled = true
 cooldown_ms = 300000
 # settle_grace_ms = 60000      # Legacy compatibility; no decision effect
 manual_hold_ms = 600000
+# return_threshold = 0.90      # Default: defaults::AUTO_SWAP_RETURN_THRESHOLD
 
 [daemon]
 poll_interval_ms = 60000
@@ -173,6 +190,7 @@ poll_interval_ms = 60000
 - Across all providers: candidate-first completion, timeout/429/401, stale exhaustion, and exhausted targets must never produce a swap; confirmed exhaustion plus a ready usable target must still swap.
 - All-exhausted fallback: active 5h exhausted + every other account confirmed exhausted → swap to the one with the earliest gating reset; tie with the active account → stay; failed/loading/stale/unknown or `manual_only` accounts in the pool → excluded (`Degraded` when the pool is empty); Warn-only (not exhausted) active + all others exhausted → stay.
 - Nested stacked windows (2026-10-08): active `5h Ok + 7d Exhausted` vs candidate `5h Ok + 7d Exhausted` → effective recovery is the blocking `7d` reset (`max`, not `min` over all windows), so the candidate with the sooner `7d` reset wins even when the active `5h` resets sooner; any blocking window missing `reset_at` means unknown recovery and excludes that account from the pool. Cursor parallel pools keep `min` semantics.
+- Return to preferred (2026-10-08): healthy active + lower-priority-number account with every gating window below `return_threshold` → swap to it; equal priorities, preferred above `return_threshold` (5h, 7d or `ModelWeek`), exhausted, failed, loading, empty or `manual_only` → stay; a preferred active never moves to a less preferred account; forced swap-away picks priority before sooner reset; `ModelWeek` exhausted blocks like `7d`.
 - 端到端：双账号 + mock HTTP，跑 `subswap` 看 keyring 与 client_targets 同步。
 
 <!-- 该文档整理/压缩于 2026-09-05 -->

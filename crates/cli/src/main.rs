@@ -10,6 +10,7 @@
 //!   A successful swap then reprints the same quota table as the default entry.
 //! - `subswap rm <id|N>`     — remove an account (registry + keyring), then reprint
 //!   the quota table.
+//! - `subswap priority [<id|N> [<value>]]` — show or set account priority (lower is preferred).
 //! - `subswap doctor`        — environment self-check.
 //!
 //! `<id>` is the account id (email for claude / account_key for codex), label, or
@@ -170,6 +171,17 @@ enum Cmd {
     /// If the account is the provider's current native login, it is also signed out there.
     Rm { id: String },
 
+    /// Show or set account priority (lower is preferred; default 100). Autoswap picks the most
+    /// preferred usable account first, and returns to it once it has headroom again.
+    Priority {
+        /// Account index (e.g. `3`), id, label, or `<provider>/<id>`. Omit to list all.
+        id: Option<String>,
+
+        /// New priority. Omit to print the current value.
+        #[arg(allow_negative_numbers = true)]
+        value: Option<i32>,
+    },
+
     /// Show or change autoswap state. No argument prints current state; 'on'/'off' to change.
     Autoswap {
         /// 'on' to enable, 'off' to disable.
@@ -259,6 +271,12 @@ async fn main() -> Result<()> {
         Some(Cmd::Shell { id }) => cmd::run::shell(&ctx, &id).await,
         Some(Cmd::Env { id }) => cmd::run::env(&ctx, &id).await,
         Some(Cmd::Rm { id }) => cmd::rm::run(&ctx, &id, cli.json).await,
+        Some(Cmd::Priority { id, value }) => {
+            if cmd::priority::run(&ctx, id.as_deref(), value)? && !cli.json {
+                cmd::default::print_status_overview(&ctx).await?;
+            }
+            Ok(())
+        }
         Some(Cmd::Autoswap { toggle }) => cmd::autoswap::run(toggle.as_deref()),
         Some(Cmd::Doctor) => cmd::doctor::run(&ctx).await,
         Some(Cmd::MigrateLocal) => cmd::migrate::run(&ctx).await,

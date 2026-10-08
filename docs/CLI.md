@@ -13,9 +13,10 @@
 | `subswap run <provider> <id> [-- args]` | 账号隔离启动：把该账号凭证投影到私有目录，设隔离环境变量后启动原生 CLI（codex/claude/kimi/commandcode/OpenCode V1 API Key），**不动全局活账号**；退出时吸收轮换后的凭证。Cursor、OpenCode 官方账号与 V2 API Key 不支持此模式 |
 | `subswap shell <id>` | 起一个导出好隔离环境变量的子 shell，交互里连跑多条命令；provider 从账号推断；退出时吸收凭证 |
 | `subswap env <id>` | 打印 `export` 行供 `eval`。**注意**：eval 模式不持锁、退出后不吸收凭证，仅供临时短用 |
+| `subswap priority [<id\|N> [<value>]]` | 账号优先级（数字越小越优先，默认 100）。无参列出全部；只给目标打印当前值；给值则写入 registry 并打印余量表（本命令不切换，切回由默认入口 / daemon 的自动切换完成）。自动切换先选最优先的可用账号，且当前账号健康时会切回余量充足的更优先账号（[AUTO_SWAP_DESIGN.md](design/AUTO_SWAP_DESIGN.md) §2.1） |
 | `subswap doctor` | 环境自检 |
 
-`add-api` / `login` / `swap <目标>` / `rm` 成功后的 status-after-action 见下节。
+`add-api` / `login` / `swap <目标>` / `rm` / `priority <目标> <值>` 成功后的 status-after-action 见下节。
 
 ### Automatic swap safety
 
@@ -54,7 +55,7 @@ eval "$(subswap env codex/bob@x.com)"   # 临时把当前 shell 指向某 codex 
 
 ### 写操作后回到状态面
 
-`add-api` / `login` / `swap <目标>` / `rm` 成功后，先打一行结果，再打印与无参 `subswap` 相同的账号余量表（编号、`*`、quota 块一致）。约束：
+`add-api` / `login` / `swap <目标>` / `rm` / `priority <目标> <值>` 成功后，先打一行结果，再打印与无参 `subswap` 相同的账号余量表（编号、`*`、quota 块一致）。约束：
 
 - 不 `sync_local_active`：刚 `rm` 掉的号不会被当场导回。
 - 不 AutoSwap：刚手动 `swap` 过去的号不会被余量刷新顶走。

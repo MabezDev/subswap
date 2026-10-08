@@ -6,6 +6,7 @@ pub mod default;
 pub mod doctor;
 pub mod login;
 pub mod migrate;
+pub mod priority;
 pub mod rm;
 pub mod run;
 pub mod swap;

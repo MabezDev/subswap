@@ -116,6 +116,7 @@ pub async fn run() -> Result<()> {
             allow_unknown: false,
             settle_grace_ms: snapshot_settings.auto_swap.settle_grace_ms,
             manual_hold_ms: snapshot_settings.auto_swap.manual_hold_ms,
+            return_threshold: snapshot_settings.auto_swap.return_threshold,
         };
         if let Err(e) = run_cycle(
             &providers,
@@ -652,6 +653,7 @@ mod tests {
             allow_unknown: false,
             settle_grace_ms: 0,
             manual_hold_ms: 0,
+            return_threshold: 0.90,
         };
 
         assert!(matches!(

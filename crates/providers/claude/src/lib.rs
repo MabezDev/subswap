@@ -905,6 +905,7 @@ impl Provider for ClaudeProvider {
             Err(e) => return Err(e),
         };
 
+        let scoped_limits = usage.scoped_weekly_limits();
         let mut out = Vec::new();
         if let Some(five) = usage.five_hour {
             out.push(make_quota(
@@ -929,6 +930,11 @@ impl Provider for ClaudeProvider {
                 extra.utilization,
                 extra.resets_at,
             ));
+        }
+        for scoped in scoped_limits {
+            let mut q = make_quota(id, QuotaWindow::ModelWeek, scoped.percent, scoped.resets_at);
+            q.note = Some(scoped.label);
+            out.push(q);
         }
         Ok(out)
     }

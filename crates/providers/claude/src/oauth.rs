@@ -59,6 +59,77 @@ pub struct UsageResponse {
     pub seven_day: Option<WindowUsage>,
     #[serde(deserialize_with = "lenient")]
     pub extra_usage: Option<ExtraUsage>,
+    /// 统一限额列表。逐项保留原始 JSON，单项变形只丢该项（见 [`Self::scoped_weekly_limits`]）。
+    #[serde(deserialize_with = "lenient")]
+    pub limits: Option<Vec<serde_json::Value>>,
+}
+
+impl UsageResponse {
+    /// `limits[]` 里按模型 / 产品面单列的周额度（`group = "weekly"` 且带 `scope`）。
+    ///
+    /// 不含 `scope` 的 session / weekly_all 与顶层 `five_hour` / `seven_day` 重复，跳过；
+    /// 解析不出显示名的 scope 也跳过，避免表格里出现无法辨认的窗口。
+    pub fn scoped_weekly_limits(&self) -> Vec<ScopedLimit> {
+        self.limits
+            .iter()
+            .flatten()
+            .filter_map(|raw| serde_json::from_value::<LimitEntry>(raw.clone()).ok())
+            .filter(|entry| entry.group.as_deref() == Some("weekly"))
+            .filter_map(|entry| {
+                Some(ScopedLimit {
+                    label: scope_label(entry.scope.as_ref()?)?,
+                    percent: entry.percent,
+                    resets_at: entry.resets_at,
+                })
+            })
+            .collect()
+    }
+}
+
+/// 一条按模型 / 产品面单列的周额度。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScopedLimit {
+    /// 模型或产品面显示名，如 `Fable`。
+    pub label: String,
+    /// 已用百分比 0~100。
+    pub percent: Option<f64>,
+    pub resets_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct LimitEntry {
+    #[serde(deserialize_with = "lenient")]
+    group: Option<String>,
+    #[serde(deserialize_with = "lenient")]
+    percent: Option<f64>,
+    #[serde(deserialize_with = "lenient")]
+    resets_at: Option<DateTime<Utc>>,
+    #[serde(deserialize_with = "lenient")]
+    scope: Option<serde_json::Value>,
+}
+
+/// scope 形如 `{"model": {"display_name": "Fable", "id": null}, "surface": null}`；
+/// `surface` 的结构未见实样，字符串与对象两种都接。
+fn scope_label(scope: &serde_json::Value) -> Option<String> {
+    let named = |v: &serde_json::Value| -> Option<String> {
+        let s = match v {
+            serde_json::Value::String(s) => s.as_str(),
+            serde_json::Value::Object(o) => o
+                .get("display_name")
+                .or_else(|| o.get("id"))
+                .and_then(serde_json::Value::as_str)?,
+            _ => return None,
+        };
+        let s = s.trim();
+        (!s.is_empty()).then(|| s.to_string())
+    };
+    let model = scope.get("model").and_then(named);
+    let surface = scope.get("surface").and_then(named);
+    match (model, surface) {
+        (Some(m), Some(s)) => Some(format!("{m}/{s}")),
+        (m, s) => m.or(s),
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -211,6 +282,57 @@ mod tests {
         assert_eq!(seven.utilization, Some(12.0));
         assert_eq!(seven.resets_at, None);
         assert!(parsed.extra_usage.is_none());
+    }
+
+    /// 2026-10 Team 席位实样：无 `seven_day`，按模型的周额度只出现在 `limits[]`。
+    #[test]
+    fn parses_scoped_weekly_limits_from_team_payload() {
+        let raw = r#"{
+            "five_hour": {"utilization": 4.0, "resets_at": "2026-10-08T17:50:00.392705+00:00"},
+            "seven_day": null,
+            "limits": [
+                {"kind": "session", "group": "session", "percent": 4, "severity": "normal",
+                 "resets_at": "2026-10-08T17:50:00.392705+00:00", "scope": null, "is_active": true},
+                {"kind": "weekly_all", "group": "weekly", "percent": 100, "severity": "critical",
+                 "resets_at": "2026-10-10T04:00:00+00:00", "scope": null, "is_active": true},
+                {"kind": "weekly_scoped", "group": "weekly", "percent": 26, "severity": "normal",
+                 "resets_at": "2026-10-11T00:00:00+00:00",
+                 "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null},
+                 "is_active": false},
+                {"kind": "weekly_scoped", "group": "weekly", "percent": "bad",
+                 "scope": {"model": {"id": null, "display_name": null}, "surface": null}},
+                "garbage"
+            ]
+        }"#;
+        let parsed: UsageResponse = serde_json::from_str(raw).unwrap();
+        assert!(parsed.seven_day.is_none());
+        let scoped = parsed.scoped_weekly_limits();
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].label, "Fable");
+        assert_eq!(scoped[0].percent, Some(26.0));
+        assert!(scoped[0].resets_at.is_some());
+    }
+
+    #[test]
+    fn malformed_limits_degrade_to_no_scoped_limits() {
+        let parsed: UsageResponse =
+            serde_json::from_str(r#"{"limits": {"not": "a list"}}"#).unwrap();
+        assert!(parsed.scoped_weekly_limits().is_empty());
+    }
+
+    #[test]
+    fn scope_label_handles_surface_shapes() {
+        let model_and_surface = serde_json::json!({
+            "model": {"display_name": "Fable"}, "surface": "claude_code"
+        });
+        assert_eq!(
+            scope_label(&model_and_surface).as_deref(),
+            Some("Fable/claude_code")
+        );
+        let surface_only =
+            serde_json::json!({"model": null, "surface": {"display_name": "Cowork"}});
+        assert_eq!(scope_label(&surface_only).as_deref(), Some("Cowork"));
+        assert_eq!(scope_label(&serde_json::json!({})), None);
     }
 
     /// 响应整体缺字段（老版本 / 精简响应）时同样不报错。

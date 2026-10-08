@@ -156,6 +156,7 @@ fn help_shows_only_current_commands() {
     assert!(stdout.contains("swap"));
     assert!(stdout.contains("rm"));
     assert!(stdout.contains("doctor"));
+    assert!(stdout.contains("priority"));
 
     for removed in [
         "  add ",
@@ -427,6 +428,65 @@ emailAddress = "active@example.com"
     assert_eq!(
         fs::read_to_string(claude.join(".credentials.json")).unwrap(),
         stale
+    );
+
+    teardown_test_keychain(&tmp);
+}
+
+/// Provider 同步元数据时按默认值重建账号；用户设的优先级不能被下一次默认入口冲掉。
+#[test]
+fn priority_survives_default_entry_metadata_sync() {
+    let tmp = tempfile::tempdir().unwrap();
+    setup_test_keychain(&tmp);
+    write_fast_quota_timeout(&tmp);
+    let claude = tmp.path().join("claude");
+    let registry = app_config_dir(&tmp).join("registry.toml");
+    let creds =
+        r#"{"claudeAiOauth":{"accessToken":"","refreshToken":"r","expiresAt":4102444800000}}"#;
+    write(
+        &registry,
+        r#"[[accounts]]
+provider = "claude"
+id = "active@example.com"
+label = "Active"
+active = true
+created_at = "2026-06-12T00:00:00Z"
+priority = 100
+
+[accounts.extra.oauth_account]
+emailAddress = "active@example.com"
+"#,
+    );
+    write(
+        &claude.join(".claude.json"),
+        r#"{"oauthAccount":{"emailAddress":"active@example.com","displayName":"Renamed"}}"#,
+    );
+    write(&claude.join(".credentials.json"), creds);
+    #[cfg(target_os = "macos")]
+    write_test_keychain_credentials(&tmp, creds);
+
+    let set = assert_success(
+        isolated_subswap(&tmp)
+            .args(["priority", "active@example.com", "7", "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert!(
+        set.contains("priority claude/active@example.com → 7"),
+        "{set}"
+    );
+
+    isolated_subswap(&tmp).arg("--json").output().unwrap();
+
+    let listing = assert_success(isolated_subswap(&tmp).arg("priority").output().unwrap());
+    assert!(
+        listing.contains("claude/active@example.com  7"),
+        "priority lost after sync:\n{listing}"
+    );
+    let saved = fs::read_to_string(&registry).unwrap();
+    assert!(
+        saved.contains("displayName = \"Renamed\""),
+        "sync did not run:\n{saved}"
     );
 
     teardown_test_keychain(&tmp);

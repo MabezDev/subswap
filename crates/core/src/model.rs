@@ -35,7 +35,9 @@ pub struct Account {
     pub created_at: DateTime<Utc>,
     /// 上次成功使用时间（切换或调用）。
     pub last_used_at: Option<DateTime<Utc>>,
-    /// 用户给的优先级（数字越小越优先）；自动切换时作为 tie-breaker。
+    /// 用户给的优先级（数字越小越优先，默认 100）。自动切换挑候选时先比它；
+    /// 当前账号健康时也会切回更优先且余量充足的账号（见 `auto_policy`）。
+    /// 只由 `subswap priority` 修改，[`crate::AccountRegistry::upsert`] 会保留已有值。
     #[serde(default = "default_priority")]
     pub priority: i32,
     /// 任意 Provider 私有 KV，用于扩展（不入 keyring）。
@@ -133,6 +135,9 @@ pub enum QuotaWindow {
     Api,
     /// Cursor 套餐 Credits（美元账本；`used`/`limit` 存分）。
     Credits,
+    /// 按模型（或产品面）单列的周额度，如 Claude Team 的 Fable 周上限。
+    /// `note` 存模型显示名；与 `SevenDay` 同样只在耗尽时阻断。
+    ModelWeek,
     /// Codex 限额重置道具（banked reset）：`used` = 可用数，`limit` = 0（不参与百分比与自动切换判定），
     /// `reset_at` = 最早过期时间。`0` 时不产生该窗口。
     ResetCredits,

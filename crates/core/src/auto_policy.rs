@@ -28,6 +28,8 @@ pub struct PolicyConfig {
     /// 暂停一切自动切换（连确定性额度切换一起挡），避免把显式选择掰回去。
     /// `hold_remaining_ms()` 为 fail-open 文件态；`0` 或负数关闭。
     pub manual_hold_ms: i64,
+    /// 回切偏好账号的余量门槛，0.0~1.0（`config.toml > auto_swap.return_threshold`）。
+    pub return_threshold: f64,
 }
 
 /// 测试专用构造：显式字段 + 保持关闭，避免 `SUBSWAP_HOME` 环境互相干扰、
@@ -41,6 +43,7 @@ fn test_config(settle_grace_ms: i64) -> PolicyConfig {
         allow_unknown: false,
         settle_grace_ms,
         manual_hold_ms: 0,
+        return_threshold: 0.90,
     }
 }
 
@@ -53,6 +56,7 @@ impl Default for PolicyConfig {
             allow_unknown: false,
             settle_grace_ms: s.auto_swap.settle_grace_ms,
             manual_hold_ms: s.auto_swap.manual_hold_ms,
+            return_threshold: s.auto_swap.return_threshold,
         }
     }
 }
@@ -190,6 +194,18 @@ pub fn decide(snapshot: &ProviderSnapshot, config: &PolicyConfig) -> PolicyDecis
     };
 
     if !needs_swap {
+        if let Some((a, target)) =
+            active.and_then(|a| preferred_return_target(snapshot, a, config).map(|t| (a, t)))
+        {
+            return PolicyDecision::Swap {
+                from: active_id,
+                to: target.account.id.clone(),
+                reason: format!(
+                    "{} within threshold; return to preferred {}",
+                    a.account.id, target.account.id
+                ),
+            };
+        }
         let id = active.map(|a| a.account.id.to_string()).unwrap_or_default();
         return PolicyDecision::NoOp {
             reason: format!("{} within threshold", id),
@@ -263,6 +279,35 @@ pub fn decide(snapshot: &ProviderSnapshot, config: &PolicyConfig) -> PolicyDecis
     PolicyDecision::Degraded {
         reason: "no swap candidate (others exhausted / fetch failed / unknown status)".into(),
     }
+}
+
+/// 当前账号健康时，找一个 `priority` 严格更优、已确认可用且余量明显充足的账号切回。
+///
+/// 余量门槛用 `return_threshold` 而不是 `threshold`：只在偏好账号离触发线还远时回切，
+/// 避免刚切回就触顶再切走。未知 / 无窗口账号永不作为回切目标。
+fn preferred_return_target<'a>(
+    snapshot: &'a ProviderSnapshot,
+    active: &AccountWithQuotas,
+    config: &PolicyConfig,
+) -> Option<&'a AccountWithQuotas> {
+    snapshot
+        .accounts
+        .iter()
+        .filter(|a| a.account.id != active.account.id)
+        .filter(|a| a.account.priority < active.account.priority)
+        .filter(|a| is_viable_candidate(a, snapshot.pool_semantics, config.threshold, false))
+        .filter(|a| has_return_headroom(a, config.return_threshold))
+        .min_by(|a, b| compare_candidates(a, b))
+}
+
+fn has_return_headroom(a: &AccountWithQuotas, return_threshold: f64) -> bool {
+    let quotas: Vec<&Quota> = auto_swap_quotas(&a.quotas).collect();
+    !quotas.is_empty()
+        && quotas.iter().all(|q| {
+            q.limit > 0
+                && !matches!(q.status, QuotaStatus::Unknown)
+                && !q.is_above(return_threshold)
+        })
 }
 
 /// 全员耗尽回退的结果：切走 / 留守（当前恢复最快）/ 无池可比。
@@ -482,13 +527,17 @@ fn auto_swap_quotas(quotas: &[Quota]) -> impl Iterator<Item = &Quota> {
 }
 
 fn compare_candidates(a: &AccountWithQuotas, b: &AccountWithQuotas) -> std::cmp::Ordering {
-    // 主排序：哪个窗口最快重置就优先选谁——尽快用完即将清零的额度，让账号尽早进入下一轮可用周期。
+    // 用户 priority 必须排第一：排在重置时间之后时，切走会先落到非偏好账号，
+    // 下一轮再被 `preferred_return_target` 拉回，平白多一次切换。
+    // 同优先级内：哪个窗口最快重置就优先选谁——尽快用完即将清零的额度。
     // 没有 reset_at 信息（多见于测试 mock）时退化为「最忙窗口」used 升序（剩余多的优先）。
     let a_reset = earliest_reset(&a.quotas);
     let b_reset = earliest_reset(&b.quotas);
-    compare_optional_reset(a_reset, b_reset)
+    a.account
+        .priority
+        .cmp(&b.account.priority)
+        .then_with(|| compare_optional_reset(a_reset, b_reset))
         .then_with(|| busiest_used(&a.quotas).cmp(&busiest_used(&b.quotas)))
-        .then(a.account.priority.cmp(&b.account.priority))
         .then(a.account.id.0.cmp(&b.account.id.0))
 }
 
@@ -1377,6 +1426,245 @@ mod tests {
         match d {
             // c 剩余更少，但重置更快，应该被优先选中
             PolicyDecision::Swap { to, .. } => assert_eq!(to.0, "c"),
+            other => panic!("expected Swap, got {other:?}"),
+        }
+    }
+
+    fn mk_windows(
+        id: &str,
+        active: bool,
+        priority: i32,
+        windows: &[(QuotaWindow, u64, QuotaStatus, Option<i64>)],
+    ) -> AccountWithQuotas {
+        let now = Utc::now();
+        let mut awq = mk_awq(id, active, 0, QuotaStatus::Ok);
+        awq.account.priority = priority;
+        awq.quotas = windows
+            .iter()
+            .map(|(window, used, status, hours)| {
+                mk_quota_with_window(
+                    *used,
+                    *status,
+                    *window,
+                    hours.map(|h| now + chrono::Duration::hours(h)),
+                )
+            })
+            .collect();
+        awq
+    }
+
+    fn stacked(accounts: Vec<AccountWithQuotas>) -> ProviderSnapshot {
+        ProviderSnapshot {
+            provider: "claude".into(),
+            pool_semantics: QuotaPoolSemantics::Stacked,
+            accounts,
+        }
+    }
+
+    use QuotaWindow::{FiveHour as H5, ModelWeek as MW, SevenDay as D7};
+
+    #[test]
+    fn healthy_active_returns_to_preferred_with_headroom() {
+        let snap = stacked(vec![
+            mk_windows("work", true, 100, &[(H5, 50, QuotaStatus::Ok, Some(2))]),
+            mk_windows(
+                "personal",
+                false,
+                10,
+                &[
+                    (H5, 0, QuotaStatus::Ok, None),
+                    (D7, 20, QuotaStatus::Ok, Some(100)),
+                ],
+            ),
+        ]);
+        match decide(&snap, &test_config(0)) {
+            PolicyDecision::Swap { from, to, reason } => {
+                assert_eq!(from.unwrap().0, "work");
+                assert_eq!(to.0, "personal");
+                assert!(reason.contains("return to preferred"), "{reason}");
+            }
+            other => panic!("expected Swap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_return_when_priorities_equal() {
+        let snap = stacked(vec![
+            mk_windows("work", true, 100, &[(H5, 50, QuotaStatus::Ok, Some(2))]),
+            mk_windows("personal", false, 100, &[(H5, 0, QuotaStatus::Ok, None)]),
+        ]);
+        assert!(matches!(
+            decide(&snap, &test_config(0)),
+            PolicyDecision::NoOp { .. }
+        ));
+    }
+
+    /// 偏好账号仍可用但已越过回切门槛：不切回，否则刚切回就会触顶再切走。
+    #[test]
+    fn no_return_when_preferred_lacks_headroom() {
+        for (window, used) in [(H5, 92), (D7, 95), (MW, 91)] {
+            let mut windows = vec![(H5, 0, QuotaStatus::Ok, Some(3))];
+            if window == H5 {
+                windows[0].1 = used;
+            } else {
+                windows.push((window, used, QuotaStatus::Warn, Some(40)));
+            }
+            let snap = stacked(vec![
+                mk_windows("work", true, 100, &[(H5, 50, QuotaStatus::Ok, Some(2))]),
+                mk_windows("personal", false, 10, &windows),
+            ]);
+            assert!(
+                matches!(decide(&snap, &test_config(0)), PolicyDecision::NoOp { .. }),
+                "{window:?} at {used}% must not trigger a return"
+            );
+        }
+    }
+
+    #[test]
+    fn no_return_to_exhausted_or_unconfirmed_preferred() {
+        let exhausted = mk_windows(
+            "personal",
+            false,
+            10,
+            &[
+                (H5, 0, QuotaStatus::Ok, None),
+                (D7, 100, QuotaStatus::Exhausted, Some(40)),
+            ],
+        );
+        let mut failed = mk_windows("personal", false, 10, &[(H5, 0, QuotaStatus::Ok, None)]);
+        failed.fetch_state = QuotaFetchState::Failed("usage returned 429".into());
+        let mut loading = mk_windows("personal", false, 10, &[]);
+        loading.fetch_state = QuotaFetchState::Loading;
+        let empty = mk_windows("personal", false, 10, &[]);
+        for preferred in [exhausted, failed, loading, empty] {
+            let snap = stacked(vec![
+                mk_windows("work", true, 100, &[(H5, 50, QuotaStatus::Ok, Some(2))]),
+                preferred,
+            ]);
+            assert!(matches!(
+                decide(&snap, &test_config(0)),
+                PolicyDecision::NoOp { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn no_return_to_manual_only_preferred() {
+        let mut api = mk_windows("api", false, 1, &[(H5, 0, QuotaStatus::Ok, None)]);
+        api.account.extra.insert("manual_only".into(), true.into());
+        let snap = stacked(vec![
+            mk_windows("work", true, 100, &[(H5, 50, QuotaStatus::Ok, Some(2))]),
+            api,
+        ]);
+        assert!(matches!(
+            decide(&snap, &test_config(0)),
+            PolicyDecision::NoOp { .. }
+        ));
+    }
+
+    /// 当前已是最偏好账号时不动，即使低优先级账号余量更多。
+    #[test]
+    fn preferred_active_never_moves_to_lower_priority() {
+        let snap = stacked(vec![
+            mk_windows("personal", true, 10, &[(H5, 80, QuotaStatus::Ok, Some(2))]),
+            mk_windows("work", false, 100, &[(H5, 0, QuotaStatus::Ok, None)]),
+        ]);
+        assert!(matches!(
+            decide(&snap, &test_config(0)),
+            PolicyDecision::NoOp { .. }
+        ));
+    }
+
+    #[test]
+    fn return_picks_most_preferred_account() {
+        let snap = stacked(vec![
+            mk_windows("work2", true, 100, &[(H5, 10, QuotaStatus::Ok, Some(2))]),
+            mk_windows("work1", false, 50, &[(H5, 0, QuotaStatus::Ok, Some(1))]),
+            mk_windows("personal", false, 10, &[(H5, 30, QuotaStatus::Ok, Some(4))]),
+        ]);
+        match decide(&snap, &test_config(0)) {
+            PolicyDecision::Swap { to, .. } => assert_eq!(to.0, "personal"),
+            other => panic!("expected Swap, got {other:?}"),
+        }
+    }
+
+    /// 切走时 priority 先于重置时间：直接落到偏好账号，免得下一轮再回切一次。
+    #[test]
+    fn swap_away_prefers_priority_over_sooner_reset() {
+        let snap = stacked(vec![
+            mk_windows("work1", true, 100, &[(H5, 99, QuotaStatus::Warn, Some(2))]),
+            mk_windows("work2", false, 100, &[(H5, 60, QuotaStatus::Ok, Some(1))]),
+            mk_windows(
+                "personal",
+                false,
+                10,
+                &[
+                    (H5, 20, QuotaStatus::Ok, Some(4)),
+                    (D7, 40, QuotaStatus::Ok, Some(100)),
+                ],
+            ),
+        ]);
+        match decide(&snap, &test_config(0)) {
+            PolicyDecision::Swap { to, .. } => assert_eq!(to.0, "personal"),
+            other => panic!("expected Swap, got {other:?}"),
+        }
+    }
+
+    /// 偏好账号整周耗尽时照常溢出到其他账号，周额度重置后才回切。
+    #[test]
+    fn exhausted_preferred_overflows_then_returns_after_reset() {
+        let blocked = stacked(vec![
+            mk_windows(
+                "personal",
+                true,
+                10,
+                &[
+                    (H5, 30, QuotaStatus::Ok, Some(3)),
+                    (D7, 100, QuotaStatus::Exhausted, Some(40)),
+                ],
+            ),
+            mk_windows("work", false, 100, &[(H5, 0, QuotaStatus::Ok, None)]),
+        ]);
+        match decide(&blocked, &test_config(0)) {
+            PolicyDecision::Swap { to, .. } => assert_eq!(to.0, "work"),
+            other => panic!("expected Swap, got {other:?}"),
+        }
+
+        let reset = stacked(vec![
+            mk_windows("work", true, 100, &[(H5, 40, QuotaStatus::Ok, Some(3))]),
+            mk_windows(
+                "personal",
+                false,
+                10,
+                &[
+                    (H5, 0, QuotaStatus::Ok, None),
+                    (D7, 0, QuotaStatus::Ok, Some(168)),
+                ],
+            ),
+        ]);
+        match decide(&reset, &test_config(0)) {
+            PolicyDecision::Swap { to, .. } => assert_eq!(to.0, "personal"),
+            other => panic!("expected Swap, got {other:?}"),
+        }
+    }
+
+    /// 按模型的周额度耗尽与 7d 一样阻断：切走，且不作为候选。
+    #[test]
+    fn exhausted_model_week_blocks_like_seven_day() {
+        let snap = stacked(vec![
+            mk_windows(
+                "work",
+                true,
+                100,
+                &[
+                    (H5, 10, QuotaStatus::Ok, Some(2)),
+                    (MW, 100, QuotaStatus::Exhausted, Some(60)),
+                ],
+            ),
+            mk_windows("personal", false, 100, &[(H5, 0, QuotaStatus::Ok, None)]),
+        ]);
+        match decide(&snap, &test_config(0)) {
+            PolicyDecision::Swap { to, .. } => assert_eq!(to.0, "personal"),
             other => panic!("expected Swap, got {other:?}"),
         }
     }
