@@ -197,6 +197,8 @@ pub fn render_to_string(
 struct RenderLayout {
     index_width: usize,
     name_width: usize,
+    /// 偏好列宽；所有账号都是默认偏好时为 0，整列不出现。
+    prefs_width: usize,
     quota_width: usize,
 }
 
@@ -219,11 +221,31 @@ fn render_layout(snapshots: &[ProviderSnapshot]) -> RenderLayout {
         .max()
         .unwrap_or(0);
 
+    let prefs_width = snapshots
+        .iter()
+        .flat_map(|s| s.accounts.iter())
+        .map(|a| prefs_tag(&a.account).chars().count())
+        .max()
+        .unwrap_or(0);
+
     RenderLayout {
         index_width,
         name_width,
+        prefs_width,
         quota_width,
     }
+}
+
+/// 非默认的账号偏好，如 `pri 10 res 15%`；全是默认值时为空。
+fn prefs_tag(account: &subswap_core::Account) -> String {
+    let mut parts = Vec::new();
+    if account.priority != 100 {
+        parts.push(format!("pri {}", account.priority));
+    }
+    if account.reserve_pct > 0 {
+        parts.push(format!("res {}%", account.reserve_pct));
+    }
+    parts.join(" ")
 }
 
 fn render_row(awq: &AccountWithQuotas, index: usize, layout: RenderLayout, color: bool) -> String {
@@ -240,11 +262,19 @@ fn render_row(awq: &AccountWithQuotas, index: usize, layout: RenderLayout, color
     let name_plain = truncate_to_width(&account_name(awq), layout.name_width);
     let name_padded = format!("{name_plain:<width$}", width = layout.name_width);
     // 激活账号保持默认色（视觉上比 dim 的兄弟亮），非激活整体灰掉。
-    let name = if active {
+    let mut name = if active {
         name_padded
     } else {
         style(color, "2", &name_padded)
     };
+    if layout.prefs_width > 0 {
+        let tag = format!(
+            "{:<width$}",
+            prefs_tag(&awq.account),
+            width = layout.prefs_width
+        );
+        name = format!("{name}  {}", style(color, "2", &tag));
+    }
 
     // 进入保留区的窗口按自动切换的视角标成耗尽（红色），余量数字仍是真实值。
     let quotas = reserve_adjusted_quotas(&awq.account, &awq.quotas);
@@ -703,12 +733,49 @@ mod tests {
         let layout = RenderLayout {
             index_width: 2,
             name_width: 16,
+            prefs_width: 0,
             quota_width: 0,
         };
         assert!(!render_row(&awq, 1, layout, true).contains("1;31"));
         awq.account.reserve_pct = 15;
         let row = render_row(&awq, 1, layout, true);
         assert!(row.contains("\x1b[1;31m 12% left"), "{row:?}");
+    }
+
+    #[test]
+    fn prefs_column_shows_only_non_default_values_and_aligns() {
+        let mut preferred = make_awq("personal", false, QuotaFetchState::Ready);
+        preferred.account.priority = 10;
+        preferred.account.reserve_pct = 15;
+        preferred.quotas = vec![quota(QuotaWindow::FiveHour, 10, 100, QuotaStatus::Ok)];
+        let mut work = make_awq("work", true, QuotaFetchState::Ready);
+        work.quotas = vec![quota(QuotaWindow::FiveHour, 20, 100, QuotaStatus::Ok)];
+        let snap = ProviderSnapshot {
+            provider: "test".into(),
+            pool_semantics: QuotaPoolSemantics::Stacked,
+            accounts: vec![preferred, work],
+        };
+        let out = render_to_string(&[snap], &[], false);
+        let rows: Vec<&str> = out.lines().filter(|l| l.contains("5h [")).collect();
+        assert!(rows[0].contains("pri 10 res 15%"), "{out}");
+        assert!(
+            !rows[1].contains("pri ") && !rows[1].contains("res "),
+            "{out}"
+        );
+        assert_eq!(rows[0].find("5h ["), rows[1].find("5h ["), "{out}");
+    }
+
+    #[test]
+    fn prefs_column_absent_when_all_defaults() {
+        let mut a = make_awq("a", true, QuotaFetchState::Ready);
+        a.quotas = vec![quota(QuotaWindow::FiveHour, 20, 100, QuotaStatus::Ok)];
+        let snap = ProviderSnapshot {
+            provider: "test".into(),
+            pool_semantics: QuotaPoolSemantics::Stacked,
+            accounts: vec![a],
+        };
+        let out = render_to_string(&[snap], &[], false);
+        assert!(out.contains("a                 5h ["), "{out:?}");
     }
 
     #[test]

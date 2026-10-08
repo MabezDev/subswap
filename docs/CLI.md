@@ -14,7 +14,7 @@
 | `subswap shell <id>` | 起一个导出好隔离环境变量的子 shell，交互里连跑多条命令；provider 从账号推断；退出时吸收凭证 |
 | `subswap env <id>` | 打印 `export` 行供 `eval`。**注意**：eval 模式不持锁、退出后不吸收凭证，仅供临时短用 |
 | `subswap priority [<id\|N> [<value>]]` | 账号优先级（数字越小越优先，默认 100）。无参列出全部；只给目标打印当前值；给值则写入 registry 并打印余量表（本命令不切换，切回由默认入口 / daemon 的自动切换完成）。自动切换先选最优先的可用账号，且当前账号健康时会切回余量充足的更优先账号（[AUTO_SWAP_DESIGN.md](design/AUTO_SWAP_DESIGN.md) §2.1） |
-| `subswap reserve [<id\|N> [<percent>]]` | 账号保留余量（0~90，默认 0）：自动切换把每个窗口最后这部分留给手机 / 其他机器，用量达到 `100 - percent` 即按耗尽处理（切走、不作候选）；手动 `swap` 不受影响。表格里进入保留区的窗口标红。列表与 `priority` 共用（[AUTO_SWAP_DESIGN.md](design/AUTO_SWAP_DESIGN.md) §2.2） |
+| `subswap reserve [<id\|N> [<percent>]]` | 账号保留余量（0~90，默认 0）：自动切换把每个窗口最后这部分留给手机 / 其他机器，用量达到 `100 - percent` 即按耗尽处理（切走、不作候选）；手动 `swap` 不受影响。表格里进入保留区的窗口标红。列表与 `priority` 共用；默认入口在账号名后用灰色 `pri N res N%` 列出非默认的优先级与保留余量（全部默认时不出现该列）（[AUTO_SWAP_DESIGN.md](design/AUTO_SWAP_DESIGN.md) §2.2） |
 | `subswap doctor` | 环境自检 |
 
 `add-api` / `login` / `swap <目标>` / `rm` / `priority <目标> <值>` / `reserve <目标> <值>` 成功后的 status-after-action 见下节。
