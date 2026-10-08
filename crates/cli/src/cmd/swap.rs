@@ -35,6 +35,10 @@ pub async fn run(ctx: &AppContext, id_input: Option<&str>, json: bool) -> Result
             if let Err(e) = subswap_core::record_manual_swap(&acc.provider) {
                 tracing::warn!(err = %e, provider = %acc.provider, "record manual hold failed");
             }
+            // 手动切到被拒账号即表示要重试；仍受限时客户端下一次被拒会重新封锁。
+            if let Err(e) = subswap_core::rejections::clear_rejection(&acc.provider, &acc.id) {
+                tracing::warn!(err = %e, provider = %acc.provider, "clear rejection failed");
+            }
             println!("swap → {}/{}", acc.provider, acc.id);
             if !json {
                 if let Some(notice) = p.post_swap_notice() {

@@ -61,6 +61,8 @@ pub struct AutoSwap {
     /// 回切偏好账号的余量门槛，0.0~1.0。偏好账号（`priority` 更小）所有判定窗口
     /// used/limit 都低于此值时，才从健康的当前账号切回它。
     pub return_threshold: f64,
+    /// 被拒记录没有上游恢复时间时的封锁时长（毫秒）。
+    pub rejection_block_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -119,6 +121,7 @@ impl Default for AutoSwap {
             settle_grace_ms: defaults::AUTO_SWAP_SETTLE_GRACE_MS,
             manual_hold_ms: defaults::AUTO_SWAP_MANUAL_HOLD_MS,
             return_threshold: defaults::AUTO_SWAP_RETURN_THRESHOLD,
+            rejection_block_ms: defaults::AUTO_SWAP_REJECTION_BLOCK_MS,
         }
     }
 }

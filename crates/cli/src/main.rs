@@ -12,6 +12,7 @@
 //!   the quota table.
 //! - `subswap priority [<id|N> [<value>]]` — show or set account priority (lower is preferred).
 //! - `subswap reserve [<id|N> [<percent>]]` — show or set the quota percent autoswap leaves unused.
+//! - `subswap hooks [install|uninstall]` — manage the Claude Code hook that reports rejections.
 //! - `subswap doctor`        — environment self-check.
 //!
 //! `<id>` is the account id (email for claude / account_key for codex), label, or
@@ -193,6 +194,20 @@ enum Cmd {
         percent: Option<u8>,
     },
 
+    /// Show, install or remove the Claude Code hook that reports usage-limit rejections,
+    /// so autoswap reacts to limits the usage endpoint does not show.
+    Hooks {
+        /// 'install' or 'uninstall'. Omit to show the current state.
+        action: Option<String>,
+    },
+
+    /// Entry point for native client hooks. Called by the client, not by users.
+    #[command(hide = true)]
+    Hook {
+        /// Hook name, e.g. `claude-stop-failure`.
+        name: String,
+    },
+
     /// Show or change autoswap state. No argument prints current state; 'on'/'off' to change.
     Autoswap {
         /// 'on' to enable, 'off' to disable.
@@ -226,6 +241,13 @@ async fn main() -> Result<()> {
     // 启动时加载 config.toml（缺失 / 解析失败时沿用默认值 + warn）。
     if let Err(e) = subswap_core::settings::reload_from_file() {
         tracing::warn!(err = %e, "load config failed; using built-in defaults");
+    }
+
+    if let Some(Cmd::Hook { name }) = &cli.cmd {
+        return match name.as_str() {
+            "claude-stop-failure" => cmd::hook::run_claude_stop_failure(),
+            other => anyhow::bail!("unknown hook {other:?}"),
+        };
     }
 
     let ctx = AppContext::build()?;
@@ -294,6 +316,8 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        Some(Cmd::Hooks { action }) => cmd::hook::run_hooks(action.as_deref()),
+        Some(Cmd::Hook { .. }) => unreachable!("handled before CLI context initialization"),
         Some(Cmd::Autoswap { toggle }) => cmd::autoswap::run(toggle.as_deref()),
         Some(Cmd::Doctor) => cmd::doctor::run(&ctx).await,
         Some(Cmd::MigrateLocal) => cmd::migrate::run(&ctx).await,

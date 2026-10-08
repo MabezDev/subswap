@@ -10,6 +10,7 @@
 mod claude_files;
 mod oauth;
 mod paths;
+pub mod stop_failure;
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};

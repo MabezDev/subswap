@@ -13,6 +13,7 @@ pub mod provider;
 pub mod quota_cache;
 pub mod quota_query;
 pub mod registry;
+pub mod rejections;
 pub mod settings;
 pub mod store;
 pub mod swap;

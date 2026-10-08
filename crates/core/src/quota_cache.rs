@@ -233,7 +233,7 @@ fn quota_expired(q: &Quota, cached_at: DateTime<Utc>, now: DateTime<Utc>) -> boo
 
 fn window_ttl(window: QuotaWindow) -> Duration {
     match window {
-        QuotaWindow::FiveHour | QuotaWindow::Custom => Duration::hours(5),
+        QuotaWindow::FiveHour | QuotaWindow::Custom | QuotaWindow::Rejected => Duration::hours(5),
         QuotaWindow::SevenDay | QuotaWindow::ModelWeek => Duration::days(7),
         QuotaWindow::Month
         | QuotaWindow::FirstPartyModels

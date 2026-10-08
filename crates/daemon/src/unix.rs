@@ -23,6 +23,7 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use fs2::FileExt;
+use subswap_core::rejections::RejectionStore;
 use subswap_core::{
     auto_decide, paths::AppPaths, query_quota_with_retry, settings, AccountRegistry,
     AccountWithQuotas, AuditEvent, AuditLog, FileStore, KeyringStore, PolicyConfig, PolicyDecision,
@@ -101,6 +102,10 @@ pub async fn run() -> Result<()> {
 
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
+    // 客户端 hook 记录被拒后发 SIGWINCH，立即跑一轮而不是等到下个轮询周期。
+    // 不能换成 SIGUSR1：其默认动作是终止，升级后尚未重启的旧 daemon 收到会直接退出；
+    // SIGWINCH 默认忽略，且 setsid 后的 daemon 没有终端，不会收到真实的窗口变化。
+    let mut wake = signal(SignalKind::window_change())?;
 
     loop {
         // 1. 每轮开头热加载配置；解析失败则沿用上次成功值 + warn。
@@ -146,6 +151,9 @@ pub async fn run() -> Result<()> {
 
         tokio::select! {
             _ = tokio::time::sleep(poll) => {}
+            _ = wake.recv() => {
+                tracing::info!("woken by client rejection report");
+            }
             _ = sigterm.recv() => {
                 tracing::info!("SIGTERM received; shutting down");
                 break;
@@ -228,8 +236,12 @@ async fn run_cycle(
     // (a) 收集每个 Provider 的快照。query_quota 失败的账号 fetch_error 带原因。
     let snapshots = build_snapshots(providers).await;
 
-    // (b) per-provider 跑决策 + 执行。
-    for snap in &snapshots {
+    // (b) per-provider 跑决策 + 执行。被拒记录每轮重读：hook 随时可能写入。
+    let rejections = RejectionStore::load();
+    let now = chrono::Utc::now();
+    for raw in &snapshots {
+        let applied = rejections.apply(raw, now);
+        let snap = &applied;
         if snap.accounts.is_empty() {
             continue;
         }

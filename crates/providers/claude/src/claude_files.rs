@@ -194,6 +194,11 @@ pub fn restore_oauth_env_in_settings(
     write_json_value(path, &root, true)
 }
 
+/// 原子写回 Claude Code 用户设置。
+pub fn write_settings(path: &Path, settings: &serde_json::Value) -> Result<()> {
+    write_json_value(path, settings, true)
+}
+
 /// 写入自定义 API 激活状态。
 pub fn write_api_state(path: &Path, state: &ApiState) -> Result<()> {
     let value = serde_json::to_value(state)?;

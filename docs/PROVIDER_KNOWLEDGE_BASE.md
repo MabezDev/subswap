@@ -79,6 +79,21 @@ Token 刷新体：`{"grant_type":"refresh_token","refresh_token":"...","client_i
 已知漂移（2026-07）：`extra_usage.used_credits` 整数→小数（伴 `currency` / `decimal_places`）→ `monthly_limit` / `used_credits` 一律 `f64`；`extra_usage` 可能无 `resets_at`；未知代号窗口（`tangelo` 等）可忽略。致命的是**已知字段类型变化**。
 全文与手法：[troubleshooting/2026-07-26](troubleshooting/2026-07-26-claude-usage-schema-drift-bad-response.md)。
 
+### Claude Code 被拒上报（StopFailure hook）
+
+usage 端点不保证报出所有限额（Team 席位 `seven_day = null`），Claude Code 真实请求的 429 才是最终裁决。
+2026-10 实测（Claude Code 2.1.294，`claude -p` 撞周上限）：
+
+- `StopFailure` hook stdin：`{hook_event_name: "StopFailure", error: "rate_limit", transcript_path, cwd, last_assistant_message, ...}`；
+  不含恢复时间与账号。隔离会话里 `transcript_path` 位于隔离目录下。
+- 同一时刻 transcript 追加一条 `isApiErrorMessage: true`、`error: "rate_limit"`、`apiErrorStatus: 429` 的 assistant 记录，
+  带 `quotaLimits: {status: "rejected", resetsAt: <unix 秒>, rateLimitType: "five_hour" | "seven_day", overageStatus, ...}`。
+  `resetsAt` 与界面提示的恢复时间一致。按模型限额（"You've reached your Fable limit"）的拒绝**没有** `quotaLimits`。
+- `quotaLimits` 只出现在被拒记录上，正常回复没有，不能用来提前预警。
+- 账号归属：hook 进程继承会话环境，`CLAUDE_CONFIG_DIR` 指向该会话的 Claude 目录，读其中 `oauthAccount`。
+
+实现与切换语义见 `stop_failure.rs` 与 [AUTO_SWAP_DESIGN.md](design/AUTO_SWAP_DESIGN.md) §2.3。
+
 ### Usage 异常状态码（429 ≠ token 失效）
 
 **429 是 usage 端点真实极严限流**（有效 token 间隔约 4s 仍 `200→429→429` + `retry-after`），不是鉴权伪装。完整排查：[troubleshooting/2026-06-14](troubleshooting/2026-06-14-claude-quota-unqueryable-429-vs-invalid-grant.md)。

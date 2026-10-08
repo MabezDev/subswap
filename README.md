@@ -98,6 +98,7 @@ subswap swap claude/alice@example.com
 
 subswap priority 1 10   # prefer account 1: autoswap returns to it once it has headroom
 subswap reserve 1 15    # autoswap leaves the last 15% of account 1 for other devices
+subswap hooks install   # let Claude Code report limit rejections, including limits quota checks can't see
 
 subswap run codex bob@example.com -- --version
 subswap shell claude/alice@example.com

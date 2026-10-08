@@ -508,6 +508,188 @@ emailAddress = "active@example.com"
     teardown_test_keychain(&tmp);
 }
 
+/// 两个 Claude 账号，`work` 为 live 登录；`work_last_used_at` 模拟其激活时间。
+fn seed_claude_pair(tmp: &tempfile::TempDir, work_last_used_at: Option<&str>) {
+    let last_used = work_last_used_at
+        .map(|t| format!("last_used_at = \"{t}\"\n"))
+        .unwrap_or_default();
+    write(
+        &app_config_dir(tmp).join("registry.toml"),
+        &format!(
+            r#"[[accounts]]
+provider = "claude"
+id = "work@example.com"
+label = "work@example.com"
+active = true
+created_at = "2026-06-12T00:00:00Z"
+{last_used}priority = 100
+
+[accounts.extra.oauth_account]
+emailAddress = "work@example.com"
+
+[[accounts]]
+provider = "claude"
+id = "personal@example.com"
+label = "personal@example.com"
+active = false
+created_at = "2026-06-12T00:00:00Z"
+priority = 100
+
+[accounts.extra.oauth_account]
+emailAddress = "personal@example.com"
+"#
+        ),
+    );
+    write(
+        &tmp.path().join("claude").join(".claude.json"),
+        r#"{"oauthAccount":{"emailAddress":"work@example.com"}}"#,
+    );
+}
+
+/// 2026-09 实样形状的周上限拒绝。
+fn write_rejection_transcript(tmp: &tempfile::TempDir) -> std::path::PathBuf {
+    let path = tmp.path().join("transcript.jsonl");
+    let entry = serde_json::json!({
+        "type": "assistant",
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "isApiErrorMessage": true,
+        "error": "rate_limit",
+        "apiErrorStatus": 429,
+        "quotaLimits": {"status": "rejected", "resetsAt": 4102444800i64, "rateLimitType": "seven_day"},
+    });
+    write(&path, &format!("{entry}\n"));
+    path
+}
+
+fn run_stop_failure_hook(tmp: &tempfile::TempDir, input: &serde_json::Value) {
+    let mut child = isolated_subswap(tmp)
+        .args(["hook", "claude-stop-failure"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.to_string().as_bytes())
+        .unwrap();
+    assert_success(child.wait_with_output().unwrap());
+}
+
+fn rejections_file(tmp: &tempfile::TempDir) -> std::path::PathBuf {
+    app_data_dir(tmp).join("state").join("rejections.json")
+}
+
+#[test]
+fn stop_failure_hook_records_rejection_for_live_account() {
+    let tmp = tempfile::tempdir().unwrap();
+    setup_test_keychain(&tmp);
+    seed_claude_pair(&tmp, None);
+    let transcript = write_rejection_transcript(&tmp);
+
+    run_stop_failure_hook(
+        &tmp,
+        &serde_json::json!({"hook_event_name": "StopFailure", "error": "rate_limit",
+                            "transcript_path": transcript}),
+    );
+
+    let saved: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(rejections_file(&tmp)).unwrap()).unwrap();
+    let entry = &saved["claude/work@example.com"];
+    assert_eq!(entry["kind"], "seven_day", "{saved}");
+    assert_eq!(entry["reset_at"], "2100-01-01T00:00:00Z", "{saved}");
+    assert!(saved.get("claude/personal@example.com").is_none());
+    let audit = fs::read_to_string(app_data_dir(&tmp).join("audit.log")).unwrap();
+    assert!(audit.contains("client_rejected"), "{audit}");
+
+    // 手动切到被拒账号即重试：清掉封锁。
+    let creds =
+        r#"{"claudeAiOauth":{"accessToken":"a","refreshToken":"r","expiresAt":4102444800000}}"#;
+    write(
+        &app_data_dir(&tmp).join("credentials.json"),
+        &serde_json::json!({ "claude:work@example.com:credentials_json": creds }).to_string(),
+    );
+    write(&tmp.path().join("claude").join(".credentials.json"), creds);
+    #[cfg(target_os = "macos")]
+    write_test_keychain_credentials(&tmp, creds);
+    assert_success(
+        isolated_subswap(&tmp)
+            .args(["swap", "work@example.com", "--json"])
+            .output()
+            .unwrap(),
+    );
+    let saved = fs::read_to_string(rejections_file(&tmp)).unwrap();
+    assert!(!saved.contains("work@example.com"), "{saved}");
+
+    teardown_test_keychain(&tmp);
+}
+
+/// daemon 已在拒绝之后切到当前账号：拒绝属于上一个账号，不能封掉当前这个。
+#[test]
+fn stop_failure_hook_ignores_rejection_older_than_activation() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed_claude_pair(&tmp, Some("2100-01-01T00:00:00Z"));
+    let transcript = write_rejection_transcript(&tmp);
+
+    run_stop_failure_hook(
+        &tmp,
+        &serde_json::json!({"error": "rate_limit", "transcript_path": transcript}),
+    );
+
+    let saved = fs::read_to_string(rejections_file(&tmp)).unwrap_or_default();
+    assert!(!saved.contains("work@example.com"), "{saved}");
+}
+
+#[test]
+fn stop_failure_hook_ignores_non_quota_errors() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed_claude_pair(&tmp, None);
+    run_stop_failure_hook(&tmp, &serde_json::json!({"error": "overloaded"}));
+    run_stop_failure_hook(&tmp, &serde_json::json!("not an object"));
+    assert!(!rejections_file(&tmp).exists());
+}
+
+#[test]
+fn hooks_install_is_idempotent_and_reversible() {
+    let tmp = tempfile::tempdir().unwrap();
+    let settings = tmp.path().join("claude").join("settings.json");
+    write(&settings, r#"{"model": "opus"}"#);
+
+    let status = assert_success(isolated_subswap(&tmp).arg("hooks").output().unwrap());
+    assert!(status.contains("not installed"), "{status}");
+    let first = assert_success(
+        isolated_subswap(&tmp)
+            .args(["hooks", "install"])
+            .output()
+            .unwrap(),
+    );
+    assert!(first.contains("hook claude-stop-failure"), "{first}");
+    let second = assert_success(
+        isolated_subswap(&tmp)
+            .args(["hooks", "install"])
+            .output()
+            .unwrap(),
+    );
+    assert!(second.contains("already installed"), "{second}");
+
+    let saved: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
+    assert_eq!(saved["model"], "opus");
+    assert_eq!(saved["hooks"]["StopFailure"].as_array().unwrap().len(), 1);
+
+    assert_success(
+        isolated_subswap(&tmp)
+            .args(["hooks", "uninstall"])
+            .output()
+            .unwrap(),
+    );
+    let saved: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
+    assert!(saved.get("hooks").is_none(), "{saved}");
+}
+
 // --- `subswap run kimi` 隔离运行：注册表驱动 dispatch（Task 11） ---
 
 #[test]

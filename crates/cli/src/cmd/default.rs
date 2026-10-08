@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use futures::future::join_all;
+use subswap_core::rejections::RejectionStore;
 use subswap_core::{
     auto_decide, is_authentication_failure, paths::AppPaths, query_quota_with_retry, settings,
     AccountId, AccountWithQuotas, AuditEvent, AuditLog, PolicyConfig, PolicyDecision,
@@ -541,10 +542,11 @@ async fn try_auto_swap_ready_provider(
     let Some(index) = snapshots.iter().position(|snap| snap.provider == provider) else {
         return Ok(());
     };
-    let snap = &snapshots[index];
-    if snap.accounts.is_empty() {
+    if snapshots[index].accounts.is_empty() {
         return Ok(());
     }
+    let view = RejectionStore::load().apply(&snapshots[index], chrono::Utc::now());
+    let snap = &view;
 
     let (from, to) = match auto_decide(snap, cfg) {
         PolicyDecision::Swap { from, to, .. } => (from, to),

@@ -163,7 +163,13 @@ pub fn decide(snapshot: &ProviderSnapshot, config: &PolicyConfig) -> PolicyDecis
 
     // 手动保持：用户刚手动切换过该 provider 时，整个 provider 暂停自动切换
     // （连确定性额度切换一起挡），把显式选择留给用户。fail-open：文件缺失/损坏视为无保持。
-    if config.manual_hold_ms > 0 {
+    // 例外：当前账号的真实请求已被拒（`Rejected`），手动选择已经不可用，保持只会让用户卡住。
+    let active_rejected = active.is_some_and(|a| {
+        a.quotas
+            .iter()
+            .any(|q| matches!(q.window, QuotaWindow::Rejected))
+    });
+    if config.manual_hold_ms > 0 && !active_rejected {
         let remaining = crate::manual_hold::hold_remaining_ms(&snapshot.provider);
         if remaining > 0 {
             let active_name = active
@@ -180,7 +186,8 @@ pub fn decide(snapshot: &ProviderSnapshot, config: &PolicyConfig) -> PolicyDecis
 
     // 1. 查询未完成或失败只能说明额度未知，不能说明当前账号不可用。
     // 候选先返回、缓存过期、额度端点 429 都不能改变当前会话的账号。
-    if let Some(a) = active {
+    // 被拒窗口是客户端真实请求的拒绝，本身就是确认，不依赖 usage 查询结果。
+    if let Some(a) = active.filter(|_| !active_rejected) {
         match &a.fetch_state {
             QuotaFetchState::Loading => {
                 return PolicyDecision::NoOp {
@@ -1244,6 +1251,42 @@ mod tests {
         }
     }
 
+    #[test]
+    fn rejection_overrides_manual_hold() {
+        let _guard = hold_test_lock().lock().unwrap();
+        let prev = std::env::var_os("SUBSWAP_HOME");
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("SUBSWAP_HOME", tmp.path().join("subswap"));
+        crate::manual_hold::record_manual_swap_with_hold("claude", 600_000).unwrap();
+        let snap = ProviderSnapshot {
+            provider: "claude".into(),
+            pool_semantics: QuotaPoolSemantics::Stacked,
+            accounts: vec![
+                mk_windows(
+                    "work",
+                    true,
+                    100,
+                    &[
+                        (QuotaWindow::FiveHour, 10, QuotaStatus::Ok, Some(2)),
+                        (QuotaWindow::Rejected, 100, QuotaStatus::Exhausted, Some(40)),
+                    ],
+                ),
+                mk_awq("personal", false, 10, QuotaStatus::Ok),
+            ],
+        };
+        let mut cfg = test_config(0);
+        cfg.manual_hold_ms = 600_000;
+        let d = decide(&snap, &cfg);
+        match prev {
+            Some(v) => std::env::set_var("SUBSWAP_HOME", v),
+            None => std::env::remove_var("SUBSWAP_HOME"),
+        }
+        assert!(
+            matches!(d, PolicyDecision::Swap { ref to, .. } if to.0 == "personal"),
+            "got {d:?}"
+        );
+    }
+
     /// 刚激活的账号 quota 还在 loading 时，沉淀宽限期内不应被自动切走
     /// （否则手动 swap 会被一次 `subswap` 或 daemon 立刻顶掉）。
     #[test]
@@ -1881,6 +1924,95 @@ mod tests {
         ]);
         match decide(&reset, &test_config(0)) {
             PolicyDecision::Swap { to, .. } => assert_eq!(to.0, "personal"),
+            other => panic!("expected Swap, got {other:?}"),
+        }
+    }
+
+    /// usage 端点看不见的限额：只有被拒窗口，5h 仍健康，也要切走且不再作为回切目标。
+    #[test]
+    fn rejected_account_swaps_away_and_is_not_returned_to() {
+        use QuotaWindow::Rejected as RJ;
+        let swap_away = stacked(vec![
+            mk_windows(
+                "work",
+                true,
+                10,
+                &[
+                    (H5, 10, QuotaStatus::Ok, Some(2)),
+                    (RJ, 100, QuotaStatus::Exhausted, Some(40)),
+                ],
+            ),
+            mk_windows("personal", false, 100, &[(H5, 0, QuotaStatus::Ok, None)]),
+        ]);
+        match decide(&swap_away, &test_config(0)) {
+            PolicyDecision::Swap { to, .. } => assert_eq!(to.0, "personal"),
+            other => panic!("expected Swap, got {other:?}"),
+        }
+
+        let no_return = stacked(vec![
+            mk_windows("personal", true, 100, &[(H5, 10, QuotaStatus::Ok, Some(2))]),
+            mk_windows(
+                "work",
+                false,
+                10,
+                &[
+                    (H5, 10, QuotaStatus::Ok, Some(2)),
+                    (RJ, 100, QuotaStatus::Exhausted, Some(40)),
+                ],
+            ),
+        ]);
+        assert!(matches!(
+            decide(&no_return, &test_config(0)),
+            PolicyDecision::NoOp { .. }
+        ));
+    }
+
+    /// 当前账号 usage 查询失败也不影响：客户端的拒绝本身就是确认。
+    #[test]
+    fn rejection_decides_even_when_active_quota_fetch_failed() {
+        let mut work = mk_windows(
+            "work",
+            true,
+            100,
+            &[(QuotaWindow::Rejected, 100, QuotaStatus::Exhausted, Some(40))],
+        );
+        work.fetch_state = QuotaFetchState::Failed("usage returned 429".into());
+        let snap = stacked(vec![
+            work,
+            mk_windows("personal", false, 100, &[(H5, 0, QuotaStatus::Ok, None)]),
+        ]);
+        match decide(&snap, &test_config(0)) {
+            PolicyDecision::Swap { to, .. } => assert_eq!(to.0, "personal"),
+            other => panic!("expected Swap, got {other:?}"),
+        }
+    }
+
+    /// 全员不可用时，被拒账号按封锁截止时间参与回退排序。
+    #[test]
+    fn rejected_everywhere_falls_back_to_soonest_unblock() {
+        use QuotaWindow::Rejected as RJ;
+        let snap = stacked(vec![
+            mk_windows(
+                "work",
+                true,
+                100,
+                &[
+                    (H5, 10, QuotaStatus::Ok, Some(2)),
+                    (RJ, 100, QuotaStatus::Exhausted, Some(40)),
+                ],
+            ),
+            mk_windows(
+                "personal",
+                false,
+                100,
+                &[(H5, 100, QuotaStatus::Exhausted, Some(3))],
+            ),
+        ]);
+        match decide(&snap, &test_config(0)) {
+            PolicyDecision::Swap { to, reason, .. } => {
+                assert_eq!(to.0, "personal");
+                assert!(reason.contains("recovers soonest"), "{reason}");
+            }
             other => panic!("expected Swap, got {other:?}"),
         }
     }

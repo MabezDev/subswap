@@ -147,6 +147,9 @@ pub enum QuotaWindow {
     /// 按模型（或产品面）单列的周额度，如 Claude Team 的 Fable 周上限。
     /// `note` 存模型显示名；与 `SevenDay` 同样只在耗尽时阻断。
     ModelWeek,
+    /// 原生客户端的真实请求被额度拒绝（见 `rejections`）。恒为耗尽，`reset_at` 是封锁截止，
+    /// `note` 存上游限额类型。只在决策 / 展示时叠加，不进 quota 缓存。
+    Rejected,
     /// Codex 限额重置道具（banked reset）：`used` = 可用数，`limit` = 0（不参与百分比与自动切换判定），
     /// `reset_at` = 最早过期时间。`0` 时不产生该窗口。
     ResetCredits,

@@ -90,6 +90,11 @@ impl AppPaths {
     /// 手动切换保持标记：`<state_dir>/manual_hold/<provider>.json`（`{"until_ms": <epoch 毫秒>}`）。
     ///
     /// `subswap swap/login` 写，CLI 默认入口与 daemon 读；文件缺失 / 解析失败视为无保持。
+    /// 客户端上报的被拒记录，见 [`crate::rejections`]。
+    pub fn rejections_file(&self) -> PathBuf {
+        self.state_dir.join("rejections.json")
+    }
+
     pub fn manual_hold_file(&self, provider: &str) -> PathBuf {
         self.state_dir
             .join("manual_hold")

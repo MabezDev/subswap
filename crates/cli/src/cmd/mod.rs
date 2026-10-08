@@ -4,6 +4,7 @@ pub mod add_api;
 pub mod autoswap;
 pub mod default;
 pub mod doctor;
+pub mod hook;
 pub mod login;
 pub mod migrate;
 pub mod prefs;

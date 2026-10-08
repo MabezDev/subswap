@@ -43,6 +43,33 @@ pub fn ensure_daemon_running() -> Result<()> {
     }
 }
 
+/// 让 daemon 立刻跑一轮。在跑 → 发 SIGWINCH 并返回 `true`（信号选择见 daemon 主循环）；
+/// 没在跑 → 按常规规则拉起（拉起后的首轮就会决策），返回 `false`。
+pub fn wake_daemon() -> Result<bool> {
+    if std::env::var_os("SUBSWAP_NO_DAEMON").is_some() {
+        return Ok(false);
+    }
+    #[cfg(unix)]
+    {
+        use subswap_core::paths::AppPaths;
+
+        let pid_path = AppPaths::resolve()?.daemon_pid_file();
+        if daemon_alive(&pid_path)? {
+            let pid = std::fs::read_to_string(&pid_path)
+                .with_context(|| format!("read pid file {}", pid_path.display()))?;
+            let status = std::process::Command::new("kill")
+                .args(["-WINCH", pid.trim()])
+                .status()
+                .context("signal daemon")?;
+            if status.success() {
+                return Ok(true);
+            }
+        }
+    }
+    ensure_daemon_running()?;
+    Ok(false)
+}
+
 #[cfg(target_os = "macos")]
 fn daemon_auto_start_enabled() -> bool {
     // macOS Keychain 授权绑定到具体进程/二进制签名。后台 daemon 默认读 keychain

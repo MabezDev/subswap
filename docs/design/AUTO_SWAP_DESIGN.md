@@ -38,7 +38,7 @@ The paragraph above is partially superseded: when **every** account is confirmed
 ### 1.2 限流触发
 
 - 真实业务接口收到 HTTP 429 或识别为限流 → **立即**触发（不等下次轮询）。
-- 实现：上游客户端钩子或 daemon 本地 IPC 上报。
+- 实现：Claude 已接通（Claude Code `StopFailure` hook，见 §2.3）；其他 Provider 尚无上报通道。
 - 权重高于阈值：quota 显示充裕也信任限流响应。
 - **不通过高频轮询制造/探测 429**；无稳定上报通道前不实现主动探测。
 
@@ -83,6 +83,20 @@ When the active account is `Ready` and does not need to swap, `decide` returns `
 Among several qualifying accounts, the most preferred wins (same ordering as rule 6). The gap between the return line and the swap line is the hysteresis band: an hourly window recovers mid-session, so a preferred account is only re-entered when it is well clear of the swap-away line and cannot bounce on one window. Longer windows (7d, `ModelWeek`, monthly) only grow until their fixed reset, so they cannot oscillate; they only need to be below their blocking line, otherwise the slice of the week between the return line and the blocking line would be stranded. Manual hold, manual-only active accounts, active-quota uncertainty, daemon cooldown and the flap/oscillation brake all apply unchanged, because the return goes through the same `decide` → `activate` path.
 
 Known costs: after a manual swap to a non-preferred account, the return happens once the manual hold expires; to stay put, give the accounts equal priority or turn autoswap off. On Codex a return swap rewrites live `auth.json`, so running sessions need a restart.
+
+### 2.3 Client rejections (2026-10-08, user decision)
+
+The usage endpoint does not report every limit: a Claude Team seat returns `seven_day = null` although Team seats have a per-member weekly limit, so a hidden limit would leave autoswap on an account that rejects every request. The client's own 429 is the final word.
+
+Report path (Claude): `subswap hooks install` adds a `StopFailure` hook to the user-level Claude Code `settings.json` (`subswap hook claude-stop-failure`; isolated `run` sessions inherit it through the copied shared settings). On `error = "rate_limit"` the hook reads the newest `isApiErrorMessage` / `rate_limit` entry from the tail of the session transcript (ignored when older than 10 minutes) and takes `quotaLimits.resetsAt` / `rateLimitType` when present. It records `core::rejections` (`<state>/rejections.json`) for the account and wakes the daemon. Other errors (overloaded, auth, network) record nothing.
+
+Attribution, which is also the race guard against the daemon: the account is the one signed in to the session's Claude directory (`CLAUDE_CONFIG_DIR`, so isolated sessions name their own account). For the global session it must still be the active account and must have been activated (`last_used_at`) no later than the rejection; otherwise the daemon or the user has already moved on and the rejection belonged to the previous account, so it is dropped rather than blocking a good account. The hook never activates anything itself: the daemon remains the only automatic swapper. It is woken with SIGWINCH (ignored by default, so a not-yet-restarted older daemon is unaffected; SIGUSR1 would kill it). Without a running daemon the hook starts one under the normal auto-start rules; with `SUBSWAP_NO_DAEMON` the next default entry acts.
+
+Effect: the daemon and default entry apply `RejectionStore::apply` before `decide` (the quota cache stays raw), adding a `Rejected` window that is always `Exhausted`. So the account swaps away, is never a candidate or return target, and joins the all-exhausted fallback with its unblock time as recovery. A rejected active account also bypasses manual hold and the active-quota uncertainty gate, because the rejection itself is the confirmation.
+
+Re-entry: blocked until `resetsAt` when the rejection carries it (session and weekly rejections do); otherwise for `auto_swap.rejection_block_ms` (default 7 days, after which any weekly limit has reset). A manual `swap` to the account clears the block, because an explicit choice means "try it"; if it is still limited the next rejection blocks it again. Expired entries are pruned on write and ignored on read.
+
+The table shows the block as `hit 7d` / `hit 5h` / `hit [  0% left reset in …]`, also on rows whose usage query failed.
 
 ### 2.2 Per-account reserve (2026-10-08, user decision)
 
@@ -186,6 +200,7 @@ cooldown_ms = 300000
 # settle_grace_ms = 60000      # Legacy compatibility; no decision effect
 manual_hold_ms = 600000
 # return_threshold = 0.90      # Default: defaults::AUTO_SWAP_RETURN_THRESHOLD
+# rejection_block_ms = 604800000  # Default: defaults::AUTO_SWAP_REJECTION_BLOCK_MS
 
 [daemon]
 poll_interval_ms = 60000
@@ -201,6 +216,7 @@ poll_interval_ms = 60000
 - All-exhausted fallback: active 5h exhausted + every other account confirmed exhausted → swap to the one with the earliest gating reset; tie with the active account → stay; failed/loading/stale/unknown or `manual_only` accounts in the pool → excluded (`Degraded` when the pool is empty); Warn-only (not exhausted) active + all others exhausted → stay.
 - Nested stacked windows (2026-10-08): active `5h Ok + 7d Exhausted` vs candidate `5h Ok + 7d Exhausted` → effective recovery is the blocking `7d` reset (`max`, not `min` over all windows), so the candidate with the sooner `7d` reset wins even when the active `5h` resets sooner; any blocking window missing `reset_at` means unknown recovery and excludes that account from the pool. Cursor parallel pools keep `min` semantics.
 - Return to preferred (2026-10-08): healthy active + lower-priority-number account with 5h below its return line → swap to it, even when its 7d / `ModelWeek` is high but not blocking; equal priorities, preferred 5h above the return line, exhausted, failed, loading, empty or `manual_only` → stay; a preferred active never moves to a less preferred account; forced swap-away picks priority before sooner reset; `ModelWeek` exhausted blocks like `7d`.
+- Client rejections (2026-10-08): a `Rejected` window swaps a 5h-healthy active account away, overrides manual hold and a failed active usage query, is never a target or return target, and ranks in the fallback by its unblock time; the hook records only `rate_limit`, attributes to the signed-in account and drops the rejection when that account was activated after it; a manual swap clears the block.
 - Reserve (2026-10-08): a window at `1 - reserve` swaps the active account away (5h and long windows); an account inside its reserve is never a target, one below the line still is; reserve lowers the 5h return line by the same amount; active inside its reserve with every other account depleted → fallback to the sooner-recovering depleted account; unknown windows and zero reserve are not rewritten.
 - 端到端：双账号 + mock HTTP，跑 `subswap` 看 keyring 与 client_targets 同步。
 

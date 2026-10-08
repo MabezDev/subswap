@@ -13,6 +13,7 @@ use std::io::{self, Write};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use subswap_core::rejections::RejectionStore;
 use subswap_core::{
     reserve_adjusted_quotas, AccountWithQuotas, ProviderSnapshot, Quota, QuotaFetchState,
     QuotaStatus, QuotaWindow,
@@ -160,7 +161,9 @@ pub fn render_to_string(
         return out;
     }
 
-    let layout = render_layout(snapshots);
+    let rejections = RejectionStore::load();
+    let now = Utc::now();
+    let layout = render_layout(snapshots, &rejections, now);
     let mut global_index: usize = 0;
     for snap in snapshots {
         let has_notice = auto_lines.iter().any(|line| line.provider == snap.provider);
@@ -185,7 +188,8 @@ pub fn render_to_string(
 
         for awq in &snap.accounts {
             global_index += 1;
-            out.push_str(&render_row(awq, global_index, layout, color));
+            let quotas = policy_view(awq, &rejections, now);
+            out.push_str(&render_row(awq, &quotas, global_index, layout, color));
             out.push('\n');
         }
         out.push('\n');
@@ -202,7 +206,11 @@ struct RenderLayout {
     quota_width: usize,
 }
 
-fn render_layout(snapshots: &[ProviderSnapshot]) -> RenderLayout {
+fn render_layout(
+    snapshots: &[ProviderSnapshot],
+    rejections: &RejectionStore,
+    now: DateTime<Utc>,
+) -> RenderLayout {
     let account_count = snapshots.iter().map(|s| s.accounts.len()).sum::<usize>();
     let index_width = account_count.to_string().len().max(2);
     let name_width = snapshots
@@ -215,9 +223,9 @@ fn render_layout(snapshots: &[ProviderSnapshot]) -> RenderLayout {
     let quota_width = snapshots
         .iter()
         .flat_map(|s| s.accounts.iter())
-        .flat_map(|a| a.quotas.iter())
-        .filter(|q| quota_has_display_value(q))
-        .map(|q| visible_width(&format_quota_compact(q, false)))
+        .flat_map(|a| policy_view(a, rejections, now))
+        .filter(quota_has_display_value)
+        .map(|q| visible_width(&format_quota_compact(&q, false)))
         .max()
         .unwrap_or(0);
 
@@ -248,7 +256,24 @@ fn prefs_tag(account: &subswap_core::Account) -> String {
     parts.join(" ")
 }
 
-fn render_row(awq: &AccountWithQuotas, index: usize, layout: RenderLayout, color: bool) -> String {
+/// 自动切换视角的额度：叠加仍在封锁期的被拒窗口，再按保留余量着色。余量数字仍是真实值。
+fn policy_view(
+    awq: &AccountWithQuotas,
+    rejections: &RejectionStore,
+    now: DateTime<Utc>,
+) -> Vec<Quota> {
+    let quotas =
+        rejections.with_rejection(&awq.account.provider, &awq.account.id, &awq.quotas, now);
+    reserve_adjusted_quotas(&awq.account, &quotas)
+}
+
+fn render_row(
+    awq: &AccountWithQuotas,
+    quotas: &[Quota],
+    index: usize,
+    layout: RenderLayout,
+    color: bool,
+) -> String {
     let active = awq.account.active;
     let star_plain = if active { "*" } else { " " };
     let star = if active {
@@ -276,20 +301,26 @@ fn render_row(awq: &AccountWithQuotas, index: usize, layout: RenderLayout, color
         name = format!("{name}  {}", style(color, "2", &tag));
     }
 
-    // 进入保留区的窗口按自动切换的视角标成耗尽（红色），余量数字仍是真实值。
-    let quotas = reserve_adjusted_quotas(&awq.account, &awq.quotas);
     let body = match &awq.fetch_state {
         QuotaFetchState::Loading => style(color, "2", "quota loading"),
         QuotaFetchState::Failed(err) => {
             let text = format!("quota {}", compact_error(err));
             // auth/rate-limit 用红，其他错误（network/timeout）也用红——
             // 失败状态本身就是高 signal，不需要再细分。
-            style(color, "31", &text)
+            let failed = style(color, "31", &text);
+            // 被拒窗口来自客户端而非 usage 查询，查询失败时也要露出来。
+            match quotas
+                .iter()
+                .find(|q| matches!(q.window, QuotaWindow::Rejected))
+            {
+                Some(q) => format!("{}  {failed}", format_quota_compact(q, color)),
+                None => failed,
+            }
         }
-        QuotaFetchState::Ready => render_quota_parts(&quotas, layout.quota_width, color),
+        QuotaFetchState::Ready => render_quota_parts(quotas, layout.quota_width, color),
         QuotaFetchState::Stale { cached_at, error } => {
             // 缓存数据 + 「为什么在用缓存」：年龄 + 压缩后的失败原因,让用户一眼看出是限流/网络等。
-            let parts = render_quota_parts(&quotas, layout.quota_width, color);
+            let parts = render_quota_parts(quotas, layout.quota_width, color);
             let age = format_age(*cached_at);
             let reason = compact_error(error);
             let tag = style(color, "2", &format!("(cached ~{age} · {reason})"));
@@ -416,6 +447,11 @@ fn attempt_count(err: &str) -> Option<&str> {
 pub fn format_quota_compact(q: &Quota, color: bool) -> String {
     let model_week_label;
     let w_label = match q.window {
+        QuotaWindow::Rejected => match q.note.as_deref() {
+            Some("five_hour") => "hit 5h",
+            Some("seven_day") => "hit 7d",
+            _ => "hit",
+        },
         QuotaWindow::FiveHour => "5h",
         QuotaWindow::SevenDay => "7d",
         QuotaWindow::ModelWeek => {
@@ -510,6 +546,7 @@ fn window_display_order(window: QuotaWindow) -> u8 {
         QuotaWindow::Credits => 6,
         QuotaWindow::ResetCredits => 7,
         QuotaWindow::Custom => 8,
+        QuotaWindow::Rejected => 9,
     }
 }
 
@@ -736,9 +773,11 @@ mod tests {
             prefs_width: 0,
             quota_width: 0,
         };
-        assert!(!render_row(&awq, 1, layout, true).contains("1;31"));
+        let view =
+            |awq: &AccountWithQuotas| policy_view(awq, &RejectionStore::default(), Utc::now());
+        assert!(!render_row(&awq, &view(&awq), 1, layout, true).contains("1;31"));
         awq.account.reserve_pct = 15;
-        let row = render_row(&awq, 1, layout, true);
+        let row = render_row(&awq, &view(&awq), 1, layout, true);
         assert!(row.contains("\x1b[1;31m 12% left"), "{row:?}");
     }
 
@@ -763,6 +802,15 @@ mod tests {
             "{out}"
         );
         assert_eq!(rows[0].find("5h ["), rows[1].find("5h ["), "{out}");
+    }
+
+    #[test]
+    fn rejected_window_names_the_limit() {
+        let mut q = quota(QuotaWindow::Rejected, 100, 100, QuotaStatus::Exhausted);
+        q.note = Some("seven_day".into());
+        assert!(format_quota_compact(&q, false).starts_with("hit 7d [  0% left"));
+        q.note = None;
+        assert!(format_quota_compact(&q, false).starts_with("hit ["));
     }
 
     #[test]
