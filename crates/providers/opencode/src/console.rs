@@ -290,6 +290,7 @@ pub fn account_from_live(live: &ConsoleLive, existing: Option<&Account>) -> Acco
         created_at: existing.map(|a| a.created_at).unwrap_or_else(Utc::now),
         last_used_at: existing.and_then(|a| a.last_used_at),
         priority: existing.map(|a| a.priority).unwrap_or(100),
+        reserve_pct: 0,
         extra,
     }
 }
@@ -575,6 +576,7 @@ mod tests {
             created_at: Utc::now(),
             last_used_at: None,
             priority: 100,
+            reserve_pct: 0,
             extra: serde_json::Map::new(),
         }
     }

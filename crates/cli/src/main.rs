@@ -11,6 +11,7 @@
 //! - `subswap rm <id|N>`     — remove an account (registry + keyring), then reprint
 //!   the quota table.
 //! - `subswap priority [<id|N> [<value>]]` — show or set account priority (lower is preferred).
+//! - `subswap reserve [<id|N> [<percent>]]` — show or set the quota percent autoswap leaves unused.
 //! - `subswap doctor`        — environment self-check.
 //!
 //! `<id>` is the account id (email for claude / account_key for codex), label, or
@@ -182,6 +183,16 @@ enum Cmd {
         value: Option<i32>,
     },
 
+    /// Show or set an account's reserve: the percent of every quota window autoswap leaves unused
+    /// for other devices (default 0). Manual `swap` ignores it.
+    Reserve {
+        /// Account index (e.g. `3`), id, label, or `<provider>/<id>`. Omit to list all.
+        id: Option<String>,
+
+        /// Percent to keep free (0-90). Omit to print the current value.
+        percent: Option<u8>,
+    },
+
     /// Show or change autoswap state. No argument prints current state; 'on'/'off' to change.
     Autoswap {
         /// 'on' to enable, 'off' to disable.
@@ -272,7 +283,13 @@ async fn main() -> Result<()> {
         Some(Cmd::Env { id }) => cmd::run::env(&ctx, &id).await,
         Some(Cmd::Rm { id }) => cmd::rm::run(&ctx, &id, cli.json).await,
         Some(Cmd::Priority { id, value }) => {
-            if cmd::priority::run(&ctx, id.as_deref(), value)? && !cli.json {
+            if cmd::prefs::priority(&ctx, id.as_deref(), value)? && !cli.json {
+                cmd::default::print_status_overview(&ctx).await?;
+            }
+            Ok(())
+        }
+        Some(Cmd::Reserve { id, percent }) => {
+            if cmd::prefs::reserve(&ctx, id.as_deref(), percent)? && !cli.json {
                 cmd::default::print_status_overview(&ctx).await?;
             }
             Ok(())

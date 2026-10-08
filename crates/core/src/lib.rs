@@ -21,8 +21,8 @@ pub mod time;
 pub use account_registry::AccountRegistry;
 pub use audit::{AuditEvent, AuditLog};
 pub use auto_policy::{
-    decide as auto_decide, AccountWithQuotas, PolicyConfig, PolicyDecision, ProviderSnapshot,
-    QuotaFetchState,
+    decide as auto_decide, reserve_adjusted_quotas, AccountWithQuotas, PolicyConfig,
+    PolicyDecision, ProviderSnapshot, QuotaFetchState,
 };
 pub use error::{Error, Result};
 pub use manual_hold::{hold_remaining_ms, record_manual_swap, record_manual_swap_with_hold};

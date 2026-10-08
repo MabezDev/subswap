@@ -143,8 +143,9 @@ impl AccountRegistry {
 
     /// 插入或更新一个账号（按 (provider, id) 主键去重）。
     ///
-    /// 更新时保留已有 `priority`：各 Provider 同步元数据时都按默认值重建 `Account`，
-    /// 不保留会把用户用 [`Self::set_priority`] 设的偏好在下一次同步时冲掉。
+    /// 更新时保留已有 `priority` / `reserve_pct`：各 Provider 同步元数据时都按默认值重建
+    /// `Account`，不保留会把用户用 [`Self::set_priority`] / [`Self::set_reserve_pct`]
+    /// 设的值在下一次同步时冲掉。
     pub fn upsert(&self, mut account: Account) -> Result<()> {
         let mut all = self.load()?;
         if let Some(existing) = all
@@ -152,6 +153,7 @@ impl AccountRegistry {
             .find(|a| a.provider == account.provider && a.id == account.id)
         {
             account.priority = existing.priority;
+            account.reserve_pct = existing.reserve_pct;
             *existing = account;
         } else {
             all.push(account);
@@ -161,6 +163,15 @@ impl AccountRegistry {
 
     /// 设置账号优先级（数字越小越优先）。
     pub fn set_priority(&self, provider: &str, id: &AccountId, priority: i32) -> Result<()> {
+        self.update(provider, id, |account| account.priority = priority)
+    }
+
+    /// 设置账号保留余量百分比（0 表示不保留）。
+    pub fn set_reserve_pct(&self, provider: &str, id: &AccountId, reserve_pct: u8) -> Result<()> {
+        self.update(provider, id, |account| account.reserve_pct = reserve_pct)
+    }
+
+    fn update(&self, provider: &str, id: &AccountId, f: impl FnOnce(&mut Account)) -> Result<()> {
         let mut all = self.load()?;
         let account = all
             .iter_mut()
@@ -169,7 +180,7 @@ impl AccountRegistry {
                 provider: provider.into(),
                 id: id.to_string(),
             })?;
-        account.priority = priority;
+        f(account);
         self.save(&all)
     }
 
@@ -261,6 +272,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_used_at: None,
             priority: 100,
+            reserve_pct: 0,
             extra: serde_json::Map::new(),
         }
     }
@@ -293,6 +305,8 @@ mod tests {
         reg.upsert(make_account("claude", "a")).unwrap();
         reg.set_priority("claude", &AccountId("a".into()), 10)
             .unwrap();
+        reg.set_reserve_pct("claude", &AccountId("a".into()), 15)
+            .unwrap();
 
         let mut resynced = make_account("claude", "a");
         resynced.label = "renamed".into();
@@ -300,6 +314,7 @@ mod tests {
 
         let a = reg.find("claude", &AccountId("a".into())).unwrap().unwrap();
         assert_eq!(a.priority, 10);
+        assert_eq!(a.reserve_pct, 15);
         assert_eq!(a.label, "renamed");
     }
 

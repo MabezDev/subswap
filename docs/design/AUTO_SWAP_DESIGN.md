@@ -78,11 +78,21 @@ When the active account is `Ready` and does not need to swap, `decide` returns `
 
 - its priority number is strictly lower than the active account's;
 - it passes the normal candidate rules (`Ready`, not `manual_only`, usable, no 5h threshold breach, no exhausted window; unknown is never enough);
-- every gating window is below `auto_swap.return_threshold` (default `defaults::AUTO_SWAP_RETURN_THRESHOLD`).
+- its `FiveHour` windows are below its return line: `min(return_threshold, swap_line - (threshold - return_threshold))`, where `swap_line` is `threshold`, or `1 - reserve` when that is lower (§2.2). With defaults and no reserve this is `auto_swap.return_threshold` (`defaults::AUTO_SWAP_RETURN_THRESHOLD`).
 
-Among several qualifying accounts, the most preferred wins (same ordering as rule 6). The gap between `return_threshold` and `threshold` is the hysteresis band: a preferred account is only re-entered when it is well clear of the swap-away line, so it cannot bounce back and forth on one window. Manual hold, manual-only active accounts, active-quota uncertainty, daemon cooldown and the flap/oscillation brake all apply unchanged, because the return goes through the same `decide` → `activate` path.
+Among several qualifying accounts, the most preferred wins (same ordering as rule 6). The gap between the return line and the swap line is the hysteresis band: an hourly window recovers mid-session, so a preferred account is only re-entered when it is well clear of the swap-away line and cannot bounce on one window. Longer windows (7d, `ModelWeek`, monthly) only grow until their fixed reset, so they cannot oscillate; they only need to be below their blocking line, otherwise the slice of the week between the return line and the blocking line would be stranded. Manual hold, manual-only active accounts, active-quota uncertainty, daemon cooldown and the flap/oscillation brake all apply unchanged, because the return goes through the same `decide` → `activate` path.
 
 Known costs: after a manual swap to a non-preferred account, the return happens once the manual hold expires; to stay put, give the accounts equal priority or turn autoswap off. On Codex a return swap rewrites live `auth.json`, so running sessions need a restart.
+
+### 2.2 Per-account reserve (2026-10-08, user decision)
+
+`Account.reserve_pct` (default 0, at most 90, set with `subswap reserve <id|N> <percent>`, kept by `upsert` like priority) is the share of every window that automation leaves for use outside subswap (phone, other machines). `decide` first maps the snapshot through `reserve_adjusted_quotas`: a gating window with known status and `used/limit ≥ 1 - reserve` becomes `Exhausted`. Every rule above then treats it as a real exhaustion:
+
+- the active account swaps away (including long windows, which otherwise only block at 100%);
+- the account is never a candidate or a return target;
+- when nothing is usable, the active account counts as confirmed dead, so the all-exhausted fallback moves to a depleted account that recovers sooner instead of continuing to spend the reserve. This deliberately trades a rate-limited local client for an intact reserve.
+
+Its effective recovery is the reset of the reserved window. Manual `swap` ignores the reserve. The default table paints reserved windows red (the remaining percentage stays the real value); `--json` and the quota cache keep raw provider statuses.
 
 `auto_swap.settle_grace_ms` and `PolicyConfig.settle_grace_ms` remain accepted for compatibility. Since v1.11.1, uncertain quotas always preserve the current account, regardless of account age or grace duration. The setting no longer changes the decision; confirmed exhaustion remains eligible for a meaningful switch. Manual hold continues to block even confirmed exhaustion.
 
@@ -190,7 +200,8 @@ poll_interval_ms = 60000
 - Across all providers: candidate-first completion, timeout/429/401, stale exhaustion, and exhausted targets must never produce a swap; confirmed exhaustion plus a ready usable target must still swap.
 - All-exhausted fallback: active 5h exhausted + every other account confirmed exhausted → swap to the one with the earliest gating reset; tie with the active account → stay; failed/loading/stale/unknown or `manual_only` accounts in the pool → excluded (`Degraded` when the pool is empty); Warn-only (not exhausted) active + all others exhausted → stay.
 - Nested stacked windows (2026-10-08): active `5h Ok + 7d Exhausted` vs candidate `5h Ok + 7d Exhausted` → effective recovery is the blocking `7d` reset (`max`, not `min` over all windows), so the candidate with the sooner `7d` reset wins even when the active `5h` resets sooner; any blocking window missing `reset_at` means unknown recovery and excludes that account from the pool. Cursor parallel pools keep `min` semantics.
-- Return to preferred (2026-10-08): healthy active + lower-priority-number account with every gating window below `return_threshold` → swap to it; equal priorities, preferred above `return_threshold` (5h, 7d or `ModelWeek`), exhausted, failed, loading, empty or `manual_only` → stay; a preferred active never moves to a less preferred account; forced swap-away picks priority before sooner reset; `ModelWeek` exhausted blocks like `7d`.
+- Return to preferred (2026-10-08): healthy active + lower-priority-number account with 5h below its return line → swap to it, even when its 7d / `ModelWeek` is high but not blocking; equal priorities, preferred 5h above the return line, exhausted, failed, loading, empty or `manual_only` → stay; a preferred active never moves to a less preferred account; forced swap-away picks priority before sooner reset; `ModelWeek` exhausted blocks like `7d`.
+- Reserve (2026-10-08): a window at `1 - reserve` swaps the active account away (5h and long windows); an account inside its reserve is never a target, one below the line still is; reserve lowers the 5h return line by the same amount; active inside its reserve with every other account depleted → fallback to the sooner-recovering depleted account; unknown windows and zero reserve are not rewritten.
 - 端到端：双账号 + mock HTTP，跑 `subswap` 看 keyring 与 client_targets 同步。
 
 <!-- 该文档整理/压缩于 2026-09-05 -->

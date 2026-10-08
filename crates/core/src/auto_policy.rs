@@ -133,6 +133,18 @@ pub fn decide(snapshot: &ProviderSnapshot, config: &PolicyConfig) -> PolicyDecis
             reason: "auto swap disabled".into(),
         };
     }
+    let reserved = ProviderSnapshot {
+        accounts: snapshot
+            .accounts
+            .iter()
+            .map(|a| AccountWithQuotas {
+                quotas: reserve_adjusted_quotas(&a.account, &a.quotas),
+                ..a.clone()
+            })
+            .collect(),
+        ..snapshot.clone()
+    };
+    let snapshot = &reserved;
     if snapshot.accounts.is_empty() {
         return PolicyDecision::Degraded {
             reason: format!("provider {} has no accounts", snapshot.provider),
@@ -281,10 +293,38 @@ pub fn decide(snapshot: &ProviderSnapshot, config: &PolicyConfig) -> PolicyDecis
     }
 }
 
+/// 按账号 `reserve_pct` 折算策略视角的额度：用量达到 `100 - reserve_pct` 的窗口记为 `Exhausted`。
+///
+/// 折算后切走、候选、全员耗尽回退都把保留余量当作已耗尽，自动切换不会花掉它；
+/// 回退时宁可切到恢复更早的耗尽号，也不留在保留区里继续用。只影响决策与展示着色，
+/// 不改写缓存或 `--json` 输出的原始用量。
+pub fn reserve_adjusted_quotas(account: &Account, quotas: &[Quota]) -> Vec<Quota> {
+    let mut out = quotas.to_vec();
+    let Some(line) = reserve_line(account) else {
+        return out;
+    };
+    for q in &mut out {
+        if quota_gates_auto_swap(q)
+            && q.limit > 0
+            && !matches!(q.status, QuotaStatus::Unknown)
+            && q.is_above(line)
+        {
+            q.status = QuotaStatus::Exhausted;
+        }
+    }
+    out
+}
+
+/// 保留余量对应的用量线（0.0~1.0）；未设置保留时为 `None`。
+fn reserve_line(account: &Account) -> Option<f64> {
+    (account.reserve_pct > 0).then(|| 1.0 - f64::from(account.reserve_pct.min(100)) / 100.0)
+}
+
 /// 当前账号健康时，找一个 `priority` 严格更优、已确认可用且余量明显充足的账号切回。
 ///
-/// 余量门槛用 `return_threshold` 而不是 `threshold`：只在偏好账号离触发线还远时回切，
-/// 避免刚切回就触顶再切走。未知 / 无窗口账号永不作为回切目标。
+/// 小时级窗口须低于 [`return_line`]：它会在会话中途恢复，离触发线太近会刚切回就切走。
+/// 长窗口只增不减，可用（未达阻断线）即可，否则周额度里阻断线以下的那段会被白白闲置。
+/// 未知 / 无窗口账号永不作为回切目标。
 fn preferred_return_target<'a>(
     snapshot: &'a ProviderSnapshot,
     active: &AccountWithQuotas,
@@ -296,17 +336,25 @@ fn preferred_return_target<'a>(
         .filter(|a| a.account.id != active.account.id)
         .filter(|a| a.account.priority < active.account.priority)
         .filter(|a| is_viable_candidate(a, snapshot.pool_semantics, config.threshold, false))
-        .filter(|a| has_return_headroom(a, config.return_threshold))
+        .filter(|a| has_return_headroom(a, return_line(&a.account, config)))
         .min_by(|a, b| compare_candidates(a, b))
 }
 
-fn has_return_headroom(a: &AccountWithQuotas, return_threshold: f64) -> bool {
+/// 小时级窗口的回切线：与该账号实际切走线保持 `threshold - return_threshold` 的滞回间隔。
+/// 设了保留余量时切走线下移到 `1 - reserve`，回切线随之下移。
+fn return_line(account: &Account, config: &PolicyConfig) -> f64 {
+    let gap = (config.threshold - config.return_threshold).max(0.0);
+    let swap_line = reserve_line(account).map_or(config.threshold, |l| l.min(config.threshold));
+    config.return_threshold.min(swap_line - gap)
+}
+
+fn has_return_headroom(a: &AccountWithQuotas, line: f64) -> bool {
     let quotas: Vec<&Quota> = auto_swap_quotas(&a.quotas).collect();
     !quotas.is_empty()
         && quotas.iter().all(|q| {
             q.limit > 0
                 && !matches!(q.status, QuotaStatus::Unknown)
-                && !q.is_above(return_threshold)
+                && !(matches!(q.window, QuotaWindow::FiveHour) && q.is_above(line))
         })
 }
 
@@ -593,6 +641,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_used_at: None,
             priority: 100,
+            reserve_pct: 0,
             extra: serde_json::Map::new(),
         }
     }
@@ -1499,25 +1548,213 @@ mod tests {
         ));
     }
 
-    /// 偏好账号仍可用但已越过回切门槛：不切回，否则刚切回就会触顶再切走。
+    /// 偏好账号 5h 越过回切线：不切回，否则刚切回就会触顶再切走。
     #[test]
-    fn no_return_when_preferred_lacks_headroom() {
-        for (window, used) in [(H5, 92), (D7, 95), (MW, 91)] {
-            let mut windows = vec![(H5, 0, QuotaStatus::Ok, Some(3))];
-            if window == H5 {
-                windows[0].1 = used;
-            } else {
-                windows.push((window, used, QuotaStatus::Warn, Some(40)));
-            }
+    fn no_return_when_preferred_five_hour_lacks_headroom() {
+        let snap = stacked(vec![
+            mk_windows("work", true, 100, &[(H5, 50, QuotaStatus::Ok, Some(2))]),
+            mk_windows(
+                "personal",
+                false,
+                10,
+                &[(H5, 92, QuotaStatus::Warn, Some(3))],
+            ),
+        ]);
+        assert!(matches!(
+            decide(&snap, &test_config(0)),
+            PolicyDecision::NoOp { .. }
+        ));
+    }
+
+    /// 长窗口只增不减，没有回切振荡：未耗尽就回切，把偏好账号的周额度用满。
+    #[test]
+    fn long_windows_below_blocking_line_still_allow_return() {
+        for window in [D7, MW] {
             let snap = stacked(vec![
                 mk_windows("work", true, 100, &[(H5, 50, QuotaStatus::Ok, Some(2))]),
-                mk_windows("personal", false, 10, &windows),
+                mk_windows(
+                    "personal",
+                    false,
+                    10,
+                    &[
+                        (H5, 0, QuotaStatus::Ok, Some(3)),
+                        (window, 95, QuotaStatus::Warn, Some(40)),
+                    ],
+                ),
             ]);
-            assert!(
-                matches!(decide(&snap, &test_config(0)), PolicyDecision::NoOp { .. }),
-                "{window:?} at {used}% must not trigger a return"
-            );
+            match decide(&snap, &test_config(0)) {
+                PolicyDecision::Swap { to, .. } => assert_eq!(to.0, "personal"),
+                other => panic!("{window:?}: expected Swap, got {other:?}"),
+            }
         }
+    }
+
+    fn with_reserve(mut a: AccountWithQuotas, reserve_pct: u8) -> AccountWithQuotas {
+        a.account.reserve_pct = reserve_pct;
+        a
+    }
+
+    #[test]
+    fn reserve_swaps_away_before_long_window_exhausts() {
+        let snap = stacked(vec![
+            with_reserve(
+                mk_windows(
+                    "personal",
+                    true,
+                    10,
+                    &[
+                        (H5, 20, QuotaStatus::Ok, Some(3)),
+                        (D7, 85, QuotaStatus::Ok, Some(40)),
+                    ],
+                ),
+                15,
+            ),
+            mk_windows("work", false, 100, &[(H5, 0, QuotaStatus::Ok, None)]),
+        ]);
+        match decide(&snap, &test_config(0)) {
+            PolicyDecision::Swap { to, .. } => assert_eq!(to.0, "work"),
+            other => panic!("expected Swap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reserve_swaps_away_on_five_hour_before_threshold() {
+        let snap = stacked(vec![
+            with_reserve(
+                mk_windows(
+                    "personal",
+                    true,
+                    10,
+                    &[(H5, 90, QuotaStatus::Warn, Some(3))],
+                ),
+                10,
+            ),
+            mk_windows("work", false, 100, &[(H5, 0, QuotaStatus::Ok, None)]),
+        ]);
+        match decide(&snap, &test_config(0)) {
+            PolicyDecision::Swap { to, .. } => assert_eq!(to.0, "work"),
+            other => panic!("expected Swap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn account_in_reserve_is_never_a_target() {
+        let snap = stacked(vec![
+            mk_windows("work", true, 100, &[(H5, 99, QuotaStatus::Warn, Some(2))]),
+            with_reserve(
+                mk_windows(
+                    "personal",
+                    false,
+                    10,
+                    &[
+                        (H5, 0, QuotaStatus::Ok, None),
+                        (D7, 86, QuotaStatus::Ok, Some(40)),
+                    ],
+                ),
+                15,
+            ),
+        ]);
+        assert!(matches!(
+            decide(&snap, &test_config(0)),
+            PolicyDecision::Degraded { .. }
+        ));
+    }
+
+    #[test]
+    fn account_below_reserve_line_is_still_a_target() {
+        let snap = stacked(vec![
+            mk_windows("work", true, 100, &[(H5, 99, QuotaStatus::Warn, Some(2))]),
+            with_reserve(
+                mk_windows(
+                    "personal",
+                    false,
+                    10,
+                    &[
+                        (H5, 0, QuotaStatus::Ok, None),
+                        (D7, 80, QuotaStatus::Ok, Some(40)),
+                    ],
+                ),
+                15,
+            ),
+        ]);
+        match decide(&snap, &test_config(0)) {
+            PolicyDecision::Swap { to, .. } => assert_eq!(to.0, "personal"),
+            other => panic!("expected Swap, got {other:?}"),
+        }
+    }
+
+    /// 保留余量下移 5h 回切线：reserve 15 + 测试滞回 8 点 → 5h 低于 77% 才回切。
+    #[test]
+    fn reserve_lowers_five_hour_return_line() {
+        let case = |used: u64| {
+            stacked(vec![
+                mk_windows("work", true, 100, &[(H5, 50, QuotaStatus::Ok, Some(2))]),
+                with_reserve(
+                    mk_windows(
+                        "personal",
+                        false,
+                        10,
+                        &[(H5, used, QuotaStatus::Ok, Some(3))],
+                    ),
+                    15,
+                ),
+            ])
+        };
+        assert!(matches!(
+            decide(&case(80), &test_config(0)),
+            PolicyDecision::NoOp { .. }
+        ));
+        assert!(matches!(
+            decide(&case(70), &test_config(0)),
+            PolicyDecision::Swap { .. }
+        ));
+    }
+
+    /// 保留区按耗尽处理：全员不可用时切到恢复更早的耗尽号，而不是留在保留区里继续花。
+    #[test]
+    fn reserve_is_not_spent_when_everything_else_is_exhausted() {
+        let snap = stacked(vec![
+            with_reserve(
+                mk_windows(
+                    "personal",
+                    true,
+                    10,
+                    &[
+                        (H5, 10, QuotaStatus::Ok, Some(3)),
+                        (D7, 88, QuotaStatus::Ok, Some(40)),
+                    ],
+                ),
+                15,
+            ),
+            mk_windows(
+                "work",
+                false,
+                100,
+                &[(H5, 100, QuotaStatus::Exhausted, Some(2))],
+            ),
+        ]);
+        match decide(&snap, &test_config(0)) {
+            PolicyDecision::Swap { to, reason, .. } => {
+                assert_eq!(to.0, "work");
+                assert!(reason.contains("recovers soonest"), "{reason}");
+            }
+            other => panic!("expected Swap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reserve_adjustment_skips_unknown_and_zero_reserve() {
+        let mut unknown = mk_quota_with_window(90, QuotaStatus::Unknown, D7, None);
+        unknown.limit = 100;
+        let known = mk_quota_with_window(90, QuotaStatus::Warn, D7, None);
+        let mut account = mk_account("a", true);
+        let untouched = reserve_adjusted_quotas(&account, std::slice::from_ref(&known));
+        assert_eq!(untouched[0].status, QuotaStatus::Warn);
+        account.reserve_pct = 15;
+        let adjusted = reserve_adjusted_quotas(&account, &[known, unknown]);
+        assert_eq!(adjusted[0].status, QuotaStatus::Exhausted);
+        assert_eq!(adjusted[1].status, QuotaStatus::Unknown);
+        assert_eq!(adjusted[0].used, 90);
     }
 
     #[test]

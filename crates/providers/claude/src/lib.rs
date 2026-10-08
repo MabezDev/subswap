@@ -205,6 +205,7 @@ impl ClaudeProvider {
                 .unwrap_or_else(Utc::now),
             last_used_at: existing.and_then(|account| account.last_used_at),
             priority: 100,
+            reserve_pct: 0,
             extra,
         };
         self.registry.upsert(account.clone())?;
@@ -595,6 +596,7 @@ impl ClaudeProvider {
                 .unwrap_or_else(Utc::now),
             last_used_at: existing.and_then(|a| a.last_used_at),
             priority: 100,
+            reserve_pct: 0,
             extra,
         };
         self.registry.upsert(account.clone())?;
@@ -628,6 +630,7 @@ impl ClaudeProvider {
                 .unwrap_or_else(Utc::now),
             last_used_at: existing.and_then(|a| a.last_used_at),
             priority: 100,
+            reserve_pct: 0,
             extra,
         };
         self.registry.upsert(account.clone())?;
@@ -1925,6 +1928,7 @@ mod tests {
                 created_at: Utc::now(),
                 last_used_at: None,
                 priority: 100,
+                reserve_pct: 0,
                 extra: serde_json::Map::new(),
             })
             .unwrap();
@@ -2073,6 +2077,7 @@ mod tests {
                 created_at: Utc::now(),
                 last_used_at: None,
                 priority: 100,
+                reserve_pct: 0,
                 extra: serde_json::Map::new(),
             })
             .unwrap();
@@ -2126,6 +2131,7 @@ mod tests {
                 created_at: Utc::now(),
                 last_used_at: None,
                 priority: 100,
+                reserve_pct: 0,
                 extra: serde_json::Map::new(),
             })
             .unwrap();
@@ -2179,6 +2185,7 @@ mod tests {
                 created_at: Utc::now(),
                 last_used_at: None,
                 priority: 100,
+                reserve_pct: 0,
                 extra: serde_json::Map::new(),
             })
             .unwrap();
@@ -2232,6 +2239,7 @@ mod tests {
                 created_at: Utc::now(),
                 last_used_at: None,
                 priority: 100,
+                reserve_pct: 0,
                 extra: serde_json::Map::new(),
             })
             .unwrap();
@@ -2500,6 +2508,7 @@ mod tests {
                 created_at: Utc::now(),
                 last_used_at: None,
                 priority: 100,
+                reserve_pct: 0,
                 extra: serde_json::Map::new(),
             })
             .unwrap();
@@ -2544,6 +2553,7 @@ mod tests {
                 created_at: Utc::now(),
                 last_used_at: None,
                 priority: 100,
+                reserve_pct: 0,
                 extra,
             })
             .unwrap();

@@ -157,6 +157,7 @@ fn help_shows_only_current_commands() {
     assert!(stdout.contains("rm"));
     assert!(stdout.contains("doctor"));
     assert!(stdout.contains("priority"));
+    assert!(stdout.contains("reserve"));
 
     for removed in [
         "  add ",
@@ -435,7 +436,7 @@ emailAddress = "active@example.com"
 
 /// Provider 同步元数据时按默认值重建账号；用户设的优先级不能被下一次默认入口冲掉。
 #[test]
-fn priority_survives_default_entry_metadata_sync() {
+fn priority_and_reserve_survive_default_entry_metadata_sync() {
     let tmp = tempfile::tempdir().unwrap();
     setup_test_keychain(&tmp);
     write_fast_quota_timeout(&tmp);
@@ -475,13 +476,28 @@ emailAddress = "active@example.com"
         set.contains("priority claude/active@example.com → 7"),
         "{set}"
     );
+    let reserve = assert_success(
+        isolated_subswap(&tmp)
+            .args(["reserve", "active@example.com", "15", "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert!(
+        reserve.contains("reserve claude/active@example.com → 15%"),
+        "{reserve}"
+    );
+    let too_high = isolated_subswap(&tmp)
+        .args(["reserve", "active@example.com", "95", "--json"])
+        .output()
+        .unwrap();
+    assert!(!too_high.status.success());
 
     isolated_subswap(&tmp).arg("--json").output().unwrap();
 
     let listing = assert_success(isolated_subswap(&tmp).arg("priority").output().unwrap());
     assert!(
-        listing.contains("claude/active@example.com  7"),
-        "priority lost after sync:\n{listing}"
+        listing.contains("claude/active@example.com         7      15%"),
+        "priority or reserve lost after sync:\n{listing}"
     );
     let saved = fs::read_to_string(&registry).unwrap();
     assert!(

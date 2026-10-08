@@ -40,6 +40,11 @@ pub struct Account {
     /// 只由 `subswap priority` 修改，[`crate::AccountRegistry::upsert`] 会保留已有值。
     #[serde(default = "default_priority")]
     pub priority: i32,
+    /// 每个窗口留给 subswap 之外（手机、其他机器）的余量百分比，默认 0。
+    /// 自动切换把用量达到 `100 - reserve_pct` 的窗口当作耗尽；手动 `swap` 不受影响。
+    /// 只由 `subswap reserve` 修改，[`crate::AccountRegistry::upsert`] 会保留已有值。
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub reserve_pct: u8,
     /// 任意 Provider 私有 KV，用于扩展（不入 keyring）。
     #[serde(default)]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -81,6 +86,10 @@ impl Account {
 
 fn default_priority() -> i32 {
     100
+}
+
+fn is_zero(v: &u8) -> bool {
+    *v == 0
 }
 
 /// 账号的计费方式：决定它在自动切换中的优先级与对外的"是否真花钱"语义。

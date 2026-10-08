@@ -14,7 +14,8 @@ use std::io::{self, Write};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use subswap_core::{
-    AccountWithQuotas, ProviderSnapshot, Quota, QuotaFetchState, QuotaStatus, QuotaWindow,
+    reserve_adjusted_quotas, AccountWithQuotas, ProviderSnapshot, Quota, QuotaFetchState,
+    QuotaStatus, QuotaWindow,
 };
 use unicode_width::UnicodeWidthChar;
 
@@ -245,6 +246,8 @@ fn render_row(awq: &AccountWithQuotas, index: usize, layout: RenderLayout, color
         style(color, "2", &name_padded)
     };
 
+    // 进入保留区的窗口按自动切换的视角标成耗尽（红色），余量数字仍是真实值。
+    let quotas = reserve_adjusted_quotas(&awq.account, &awq.quotas);
     let body = match &awq.fetch_state {
         QuotaFetchState::Loading => style(color, "2", "quota loading"),
         QuotaFetchState::Failed(err) => {
@@ -253,10 +256,10 @@ fn render_row(awq: &AccountWithQuotas, index: usize, layout: RenderLayout, color
             // 失败状态本身就是高 signal，不需要再细分。
             style(color, "31", &text)
         }
-        QuotaFetchState::Ready => render_quota_parts(&awq.quotas, layout.quota_width, color),
+        QuotaFetchState::Ready => render_quota_parts(&quotas, layout.quota_width, color),
         QuotaFetchState::Stale { cached_at, error } => {
             // 缓存数据 + 「为什么在用缓存」：年龄 + 压缩后的失败原因,让用户一眼看出是限流/网络等。
-            let parts = render_quota_parts(&awq.quotas, layout.quota_width, color);
+            let parts = render_quota_parts(&quotas, layout.quota_width, color);
             let age = format_age(*cached_at);
             let reason = compact_error(error);
             let tag = style(color, "2", &format!("(cached ~{age} · {reason})"));
@@ -685,11 +688,27 @@ mod tests {
                 created_at: Utc::now(),
                 last_used_at: None,
                 priority: 100,
+                reserve_pct: 0,
                 extra: serde_json::Map::new(),
             },
             quotas: Vec::new(),
             fetch_state: fetch,
         }
+    }
+
+    #[test]
+    fn window_inside_reserve_renders_as_full() {
+        let mut awq = make_awq("a", true, QuotaFetchState::Ready);
+        awq.quotas = vec![quota(QuotaWindow::SevenDay, 88, 100, QuotaStatus::Ok)];
+        let layout = RenderLayout {
+            index_width: 2,
+            name_width: 16,
+            quota_width: 0,
+        };
+        assert!(!render_row(&awq, 1, layout, true).contains("1;31"));
+        awq.account.reserve_pct = 15;
+        let row = render_row(&awq, 1, layout, true);
+        assert!(row.contains("\x1b[1;31m 12% left"), "{row:?}");
     }
 
     #[test]

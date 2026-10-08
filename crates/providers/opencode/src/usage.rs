@@ -184,6 +184,7 @@ mod tests {
             created_at: Utc::now(),
             last_used_at: None,
             priority: 100,
+            reserve_pct: 0,
             extra: serde_json::Map::new(),
         }
     }
