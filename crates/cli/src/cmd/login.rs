@@ -295,22 +295,56 @@ async fn run_native_login(program: &'static str, args: Vec<String>) -> Result<()
     .context("native login task failed")?
 }
 
-/// 尽量让子进程拿到对 `/dev/tty` 的全新句柄。任何一步失败都安全退回到
+/// 尽量让子进程拿到对控制终端的全新句柄。任何一步失败都安全退回到
 /// `Stdio::inherit()`,这样在没有 TTY 的场景(CI / 管道)下行为不变。
 fn open_controlling_tty_for_child() -> (Stdio, Stdio, Stdio) {
-    let tty_in = std::fs::OpenOptions::new().read(true).open("/dev/tty").ok();
-    let tty_out = std::fs::OpenOptions::new()
-        .write(true)
-        .open("/dev/tty")
-        .ok();
-    let tty_err = std::fs::OpenOptions::new()
-        .write(true)
-        .open("/dev/tty")
-        .ok();
-    match (tty_in, tty_out, tty_err) {
+    let Some(path) = controlling_tty_path() else {
+        return (Stdio::inherit(), Stdio::inherit(), Stdio::inherit());
+    };
+    let open = |read: bool| {
+        std::fs::OpenOptions::new()
+            .read(read)
+            .write(!read)
+            .open(&path)
+            .ok()
+    };
+    match (open(true), open(false), open(false)) {
         (Some(i), Some(o), Some(e)) => (Stdio::from(i), Stdio::from(o), Stdio::from(e)),
         _ => (Stdio::inherit(), Stdio::inherit(), Stdio::inherit()),
     }
+}
+
+/// 控制终端的设备路径。优先用 fd 0/1/2 所在终端的真实设备(如 `/dev/ttys001`):
+/// macOS 的 kqueue 对经 `/dev/tty` 别名打开的 fd 返回 EINVAL,
+/// 用 Bun 打包的 Claude Code 监听 stdin 时会直接崩溃。
+#[cfg(unix)]
+fn controlling_tty_path() -> Option<std::path::PathBuf> {
+    if let Some(path) = [0, 1, 2].into_iter().find_map(tty_device_path) {
+        return Some(path);
+    }
+    (!cfg!(target_os = "macos")).then(|| "/dev/tty".into())
+}
+
+#[cfg(not(unix))]
+fn controlling_tty_path() -> Option<std::path::PathBuf> {
+    None
+}
+
+/// fd 是终端时返回其真实设备路径,否则 `None`。用 `ttyname_r`,
+/// 因为 `ttyname` 的静态缓冲区在 tokio 多线程下不安全。
+#[cfg(unix)]
+fn tty_device_path(fd: std::os::fd::RawFd) -> Option<std::path::PathBuf> {
+    use std::ffi::CStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut buf = [0 as libc::c_char; 256];
+    // SAFETY: buf 可写且长度如实传入;成功时 ttyname_r 写入以 NUL 结尾的路径。
+    if unsafe { libc::ttyname_r(fd, buf.as_mut_ptr(), buf.len()) } != 0 {
+        return None;
+    }
+    // SAFETY: 上面成功返回保证 buf 内是以 NUL 结尾的 C 字符串。
+    let name = unsafe { CStr::from_ptr(buf.as_ptr()) };
+    Some(std::ffi::OsStr::from_bytes(name.to_bytes()).into())
 }
 
 fn command_display(program: &str, args: &[String]) -> String {
@@ -328,5 +362,84 @@ fn shellish_quote(value: &str) -> String {
         value.to_string()
     } else {
         format!("{value:?}")
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::ffi::{CStr, OsStr};
+    use std::fs::{File, OpenOptions};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::path::{Path, PathBuf};
+
+    /// 开一对伪终端,返回 master 与 slave 设备路径;不依赖测试进程自己有终端。
+    fn open_pty() -> (OwnedFd, PathBuf) {
+        // SAFETY: 只调用 POSIX pty 接口并逐一检查返回值;ptsname 的静态缓冲区立即拷贝走。
+        unsafe {
+            let raw = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+            assert!(raw >= 0, "posix_openpt failed");
+            let master = OwnedFd::from_raw_fd(raw);
+            assert_eq!(libc::grantpt(master.as_raw_fd()), 0, "grantpt failed");
+            assert_eq!(libc::unlockpt(master.as_raw_fd()), 0, "unlockpt failed");
+            let name = libc::ptsname(master.as_raw_fd());
+            assert!(!name.is_null(), "ptsname failed");
+            let path = OsStr::from_bytes(CStr::from_ptr(name).to_bytes()).into();
+            (master, path)
+        }
+    }
+
+    /// 以 O_NOCTTY 打开终端设备,避免测试进程把它变成自己的控制终端。
+    fn open_tty(path: &Path) -> File {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOCTTY)
+            .open(path)
+            .expect("open pty slave")
+    }
+
+    #[test]
+    fn tty_device_path_resolves_real_device_not_dev_tty_alias() {
+        let (_master, slave_path) = open_pty();
+        let slave = open_tty(&slave_path);
+
+        let resolved = tty_device_path(slave.as_raw_fd()).expect("slave is a tty");
+        assert_eq!(resolved, slave_path);
+        assert_ne!(resolved, Path::new("/dev/tty"));
+    }
+
+    #[test]
+    fn tty_device_path_is_none_for_non_tty() {
+        let file = tempfile::tempfile().expect("tempfile");
+        assert_eq!(tty_device_path(file.as_raw_fd()), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn resolved_tty_device_is_accepted_by_kqueue() {
+        let (_master, slave_path) = open_pty();
+        let slave = open_tty(&slave_path);
+        let reopened = open_tty(&tty_device_path(slave.as_raw_fd()).expect("slave is a tty"));
+
+        // SAFETY: kq 由本测试创建并关闭;kevent 只注册一个事件,不取回事件。
+        unsafe {
+            let kq = libc::kqueue();
+            assert!(kq >= 0, "kqueue failed");
+            let change = libc::kevent {
+                ident: reopened.as_raw_fd() as libc::uintptr_t,
+                filter: libc::EVFILT_READ,
+                flags: libc::EV_ADD,
+                fflags: 0,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            };
+            let rc = libc::kevent(kq, &change, 1, std::ptr::null_mut(), 0, std::ptr::null());
+            let err = std::io::Error::last_os_error();
+            libc::close(kq);
+            assert_eq!(rc, 0, "kqueue rejected the tty fd handed to login: {err}");
+        }
     }
 }
